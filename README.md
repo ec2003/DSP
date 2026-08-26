@@ -1,5 +1,9 @@
 # DSP Speaker Embedding Experiment
 
+## Introduction
+
+This is a school project that obey the requirements in [this doc.](/project_requirements/DSP501_Final_Assignment%20Jul%202026.docx.pdf). 
+
 This project fine-tunes the same pretrained ECAPA-TDNN speaker encoder under three controlled conditions:
 
 1. `clean_baseline`: clean VCTK audio.
