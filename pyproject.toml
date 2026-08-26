@@ -5,15 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "av>=18.1.0",
-    "jupyter>=1.1.1",
-    "librosa>=1.0.0",
-    "matplotlib>=3.11.1",
-    "spicy>=0.16.0",
-    "streamlit>=1.62.0",
+    "hdbscan>=0.8.40",
+    "jupyterlab>=4.4.0",
+    "matplotlib>=3.10.0",
+    "pytorch-metric-learning>=2.8.1",
+    "pytest>=8.3.5",
+    "scikit-learn>=1.6.1",
+    "scipy>=1.15.2",
+    "speechbrain>=1.0.3",
     "torch>=2.13.0",
+    "torchcodec>=0.8.1",
     "torchaudio>=2.11.0",
-    "torchvision>=0.28.0",
-    "tqdm>=4.70.0",
-    "wandb>=0.28.2",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
