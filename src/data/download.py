@@ -9,7 +9,8 @@ import urllib.request
 import zipfile
 
 
-VCTK_URL = "https://datashare.ed.ac.uk/items/30e7453c-9ea8-48b4-8e18-f96d0dc62928/full"
+# The item page is an HTML application; download the official VCTK archive bitstream instead.
+VCTK_URL = "https://datashare.ed.ac.uk/bitstreams/535f4286-e54c-4038-838c-a02285e32cb2/download"
 VCTK_MD5 = "8a6ba2946b36fcbef0212cad601f4bfa"
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 MUSAN_MD5 = "0c472d4fc0c5141eca47ad1ffeb2a7df"
