@@ -28,6 +28,7 @@ class EcapaSpeakerEncoder(nn.Module):
         source: str,
         cache_dir: Path,
         device: torch.device,
+        revision: str | None = None,
     ) -> EcapaSpeakerEncoder:
         from speechbrain.inference.speaker import EncoderClassifier
 
@@ -35,6 +36,7 @@ class EcapaSpeakerEncoder(nn.Module):
             source=source,
             savedir=str(cache_dir),
             run_opts={"device": str(device)},
+            revision=revision,
         )
         return cls(
             compute_features=classifier.mods.compute_features,
@@ -49,11 +51,19 @@ class EcapaSpeakerEncoder(nn.Module):
             raise ValueError("ECAPA expects waveforms with shape [batch, time]")
 
         lengths = torch.ones(waveforms.shape[0], device=waveforms.device)
-        features = self.compute_features(waveforms)
-        features = self.mean_var_norm(features, lengths)
+        features = self.filterbank_features(waveforms, lengths)
         embeddings = self.embedding_model(features, lengths)
         embeddings = embeddings.squeeze(1)
         return functional.normalize(embeddings, p=2, dim=-1)
+
+    def filterbank_features(self, waveforms: Tensor, lengths: Tensor | None = None) -> Tensor:
+        """Expose ECAPA's internal filterbank frames for diagnostic plots only."""
+        if waveforms.ndim == 1:
+            waveforms = waveforms.unsqueeze(0)
+        if waveforms.ndim != 2:
+            raise ValueError("ECAPA expects waveforms with shape [batch, time]")
+        lengths = lengths if lengths is not None else torch.ones(waveforms.shape[0], device=waveforms.device)
+        return self.mean_var_norm(self.compute_features(waveforms), lengths)
 
     def set_embedding_trainable(self, trainable: bool) -> None:
         for parameter in self.embedding_model.parameters():

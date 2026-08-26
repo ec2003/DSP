@@ -225,3 +225,8 @@ __marimo__/
 
 # Models
 resources/
+outputs/
+release/
+pretrained_models/
+dataset/VCTK-Corpus-0.92/
+dataset/musan/

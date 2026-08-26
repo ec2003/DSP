@@ -141,9 +141,7 @@ class CompositeMusanNoiseMixer:
     def __call__(
         self, waveform: Tensor, sample_rate: int, record: ManifestRecord
     ) -> Tensor:
-        noise_sample = self.build_noise(
-            record, sample_rate=sample_rate, target_length=waveform.numel()
-        )
+        noise_sample = self.build_noise(record, sample_rate=sample_rate, target_length=waveform.numel())
         return mix_at_snr(waveform, noise_sample.composite, noise_sample.snr_db)
 
     def build_noise(
@@ -152,6 +150,7 @@ class CompositeMusanNoiseMixer:
         *,
         sample_rate: int,
         target_length: int,
+        snr_db: int | None = None,
     ) -> CompositeNoiseSample:
         source_paths = self._select_component_paths(record.sample_id)
         components = {
@@ -170,7 +169,7 @@ class CompositeMusanNoiseMixer:
             components=components,
             source_paths=source_paths,
             composite=composite,
-            snr_db=self._select_snr(record.sample_id),
+            snr_db=self._select_snr(record.sample_id) if snr_db is None else snr_db,
         )
 
     def _load_component(

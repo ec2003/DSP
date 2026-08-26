@@ -1,0 +1,185 @@
+---
+title: "DSP501: Noise-Robust Speaker Verification"
+subtitle: "Reproducible offline DSP ablation study"
+author: "[Replace with student name and group]"
+date: last-modified
+format:
+  html:
+    embed-resources: true
+    toc: true
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  error: true
+bibliography: references.bib
+---
+
+```{python}
+#| label: setup-artifacts
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+from IPython.display import Markdown, display
+
+PROJECT_ROOT = Path.cwd().resolve()
+CONFIG_PATH = PROJECT_ROOT / "configs" / "dsp501-v1.json"
+if not CONFIG_PATH.is_file():
+    raise FileNotFoundError(f"Missing study configuration: {CONFIG_PATH}")
+
+config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+STUDY_ROOT = PROJECT_ROOT / config["output_root"] / config["study_id"]
+REPORT_ROOT = STUDY_ROOT / "reports"
+required_artifacts = {
+    "tuning result": STUDY_ROOT / "tuning.json",
+    "metric summary": REPORT_ROOT / "metric-summary.csv",
+    "paired bootstrap intervals": REPORT_ROOT / "paired-bootstrap-ci.json",
+    "SNR curve": REPORT_ROOT / "snr-curves.png",
+    "ablation figure": REPORT_ROOT / "ablation-f1.png",
+    "confusion matrices": REPORT_ROOT / "confusion-matrices.png",
+    "waveform diagnostic": REPORT_ROOT / "waveforms.png",
+    "PSD/spectrogram diagnostic": REPORT_ROOT / "psd-spectrogram.png",
+    "MFCC diagnostic": REPORT_ROOT / "mfcc.png",
+    "filter-response diagnostic": REPORT_ROOT / "filter-response.png",
+}
+missing = [f"{name}: {path}" for name, path in required_artifacts.items() if not path.is_file()]
+if missing:
+    raise FileNotFoundError(
+        "This report requires completed saved study artifacts. Run "
+        "`uv run python run.py --config configs/dsp501-v1.json all` first.\nMissing:\n- "
+        + "\n- ".join(missing)
+    )
+
+with (REPORT_ROOT / "metric-summary.csv").open(newline="", encoding="utf-8") as stream:
+    metric_rows = list(csv.DictReader(stream))
+tuning = json.loads((STUDY_ROOT / "tuning.json").read_text(encoding="utf-8"))
+bootstrap_intervals = json.loads((REPORT_ROOT / "paired-bootstrap-ci.json").read_text(encoding="utf-8"))
+mfcc_reports = sorted(STUDY_ROOT.glob("seed-*/*/evaluation-mfcc-cosine.json"))
+if not mfcc_reports:
+    raise FileNotFoundError(f"Missing saved MFCC-cosine reports below {STUDY_ROOT}; run `evaluate`.")
+mfcc_reference = json.loads(mfcc_reports[0].read_text(encoding="utf-8"))
+```
+
+# Research problem and questions
+
+Text-independent speaker verification must distinguish same-speaker from different-speaker utterance pairs despite acoustic contamination. This study tests whether an offline digital-signal-processing (DSP) front end improves a SpeechBrain ECAPA-TDNN encoder on VCTK speech mixed with deterministic composite MUSAN noise [@vctk; @musan; @ecapa; @speechbrain].
+
+**RQ1.** How does composite noise affect verification across 5, 10, 15, and 20 dB test SNR? **RQ2.** Do high-pass, low-pass, and Wiener stages improve the raw-noisy control? **H1.** Full DSP improves F1 and/or EER at low SNR relative to raw-noisy audio.
+
+# DSP methodology
+
+VCTK 0.92 source clips are cropped deterministically, resampled to mono 16 kHz, and mixed with environmental, low-band (20–300 Hz), and high-band (3–7.5 kHz) MUSAN components. At the 16 kHz ECAPA input rate, the observable band ends at the 8 kHz Nyquist frequency. The protocol compares five conditions:
+
+| Condition | Transform after mixing |
+|---|---|
+| `clean_reference` | Clean 16 kHz reference/ceiling |
+| `raw_noisy` | Composite MUSAN noise only |
+| `high_pass` | 80 Hz high-pass |
+| `high_pass_low_pass` | 80 Hz high-pass + 7.5 kHz low-pass |
+| `full_dsp` | Both filters + Wiener filter (window 29) |
+
+The Butterworth filters are zero-phase. Accordingly, this is an offline filtering study, not evidence that the method is deployable in a causal streaming system.
+
+## Signal diagnostics
+
+The saved analysis-stage plots document a single deterministic held-out clip. They are diagnostic evidence only; they do not replace the paired verification evaluation.
+
+![Saved waveform diagnostic for the clean, noisy, and DSP-stage signals.](outputs/dsp501-speaker-verification-v1/reports/waveforms.png){#fig-waveforms fig-alt="Saved waveform diagnostic"}
+
+![Saved PSD and full-DSP spectrogram diagnostic.](outputs/dsp501-speaker-verification-v1/reports/psd-spectrogram.png){#fig-psd-spectrogram fig-alt="Saved PSD and spectrogram diagnostic"}
+
+![Saved MFCC diagnostic comparing raw-noisy and full-DSP signals.](outputs/dsp501-speaker-verification-v1/reports/mfcc.png){#fig-mfcc fig-alt="Saved MFCC diagnostic"}
+
+![Saved Butterworth filter response.](outputs/dsp501-speaker-verification-v1/reports/filter-response.png){#fig-filter-response fig-alt="Saved filter response"}
+
+# Models and comparison
+
+The primary model is the pretrained SpeechBrain ECAPA-TDNN speaker encoder [@ecapa; @speechbrain], fine-tuned under the fixed condition/seed protocol. The encoder consumes waveforms rather than handcrafted features. The DSP-only reference uses 40-coefficient MFCC frames over 80 mel bands, summarizes them with coefficient mean and standard deviation, L2-normalizes the result, and scores pairs with cosine similarity. Its results are loaded from saved `evaluation-mfcc-cosine.json` artifacts rather than recomputed here.
+
+```{python}
+#| label: mfcc-reference
+display(Markdown("## Saved MFCC-cosine reference"))
+display(mfcc_reference)
+```
+
+# Experimental controls
+
+The versioned configuration fixes three-second clips, 50 clips per speaker, speaker-disjoint 80/10/10 splits, seeds 11/22/33, and the four test SNRs. All noisy conditions share deterministic source clips, noise provenance, and balanced verification pairs. Thresholds are selected from validation pairs and then fixed on each test protocol; no test-set threshold selection occurs.
+
+The mandated raw-noisy tuning grid spans learning rates {3e-5, 1e-4} and encoder-freeze epochs {0, 1}. The selected values are locked before training every condition and seed.
+
+```{python}
+#| label: tuning-results
+display(Markdown("## Saved tuning result"))
+display(tuning)
+```
+
+# Results
+
+The values below are the unmodified saved analysis output. Lower EER is better; higher ROC-AUC, accuracy, precision, recall, and F1 are better. `clean_reference` remains a separate clean-test reference rather than a noisy head-to-head result.
+
+```{python}
+#| label: metric-summary
+display(Markdown(f"## Saved metric rows ({len(metric_rows)})"))
+display(metric_rows)
+```
+
+![Mean F1 across test SNRs and seeds, loaded from the analysis artifact.](outputs/dsp501-speaker-verification-v1/reports/ablation-f1.png){#fig-ablation fig-alt="Saved F1 ablation figure"}
+
+![EER by test SNR, loaded from the analysis artifact.](outputs/dsp501-speaker-verification-v1/reports/snr-curves.png){#fig-snr-curves fig-alt="Saved SNR curve figure"}
+
+![Saved confusion matrices at 5 dB test SNR.](outputs/dsp501-speaker-verification-v1/reports/confusion-matrices.png){#fig-confusion-matrices fig-alt="Saved confusion matrices"}
+
+## Paired uncertainty
+
+The following saved intervals are paired, class-stratified bootstrap 95% confidence intervals for full-DSP minus raw-noisy F1. Interpret them alongside the per-seed and per-SNR results rather than treating a single aggregate figure as conclusive.
+
+```{python}
+#| label: bootstrap-results
+display(bootstrap_intervals)
+```
+
+# Error analysis
+
+False-positive and false-negative cases are retained in each saved evaluation JSON with pair identifiers, score, threshold margin, source identifiers, requested SNR, residual SNR, and MFCC diagnostics. This report intentionally does not regenerate errors or metrics.
+
+```{python}
+#| label: error-analysis
+error_reports = sorted(STUDY_ROOT.glob("seed-*/*/evaluation-test-snr-*.json"))
+if not error_reports:
+    raise FileNotFoundError(f"No saved test evaluation reports below {STUDY_ROOT}; run `evaluate`.")
+saved_errors = []
+for report in error_reports:
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    saved_errors.extend({**error, "report": str(report.relative_to(PROJECT_ROOT))} for error in payload.get("errors", []))
+display(Markdown(f"## Saved error cases ({len(saved_errors)})"))
+display(saved_errors[:50])
+```
+
+# Limitations
+
+The conclusions apply to VCTK, the deterministic MUSAN construction, the selected ECAPA revision, and this fixed offline protocol. They do not establish robustness to arbitrary microphones, languages, real-time operation, unseen noise distributions, demographic balance, spoofing, or adversarial conditions. The filter chain may remove speaker-relevant detail even when a signal-level diagnostic appears improved.
+
+# Ethics and AI declaration
+
+**Ethics placeholder.** [Describe dataset-license compliance, privacy considerations, potential biometric misuse, and mitigation before submission.]\
+**AI-use declaration placeholder.** [Describe any AI assistance used in writing, coding, analysis, and editing according to the course policy.]
+
+# Reproducibility
+
+The CLI is the canonical execution layer, `main.ipynb` is a read-only technical dashboard/orchestrator, and this QMD is the final presentation layer. After reviewing and accepting the data licenses, reproduce the complete run with:
+
+```bash
+uv sync
+uv run python run.py download-data --accept-data-licenses
+uv run python run.py --config configs/dsp501-v1.json all
+uv run pytest -q
+quarto render report.qmd
+```
+
+The release bundle excludes raw datasets and records SHA-256 checksums. Verify its contents with `uv run python run.py --config configs/dsp501-v1.json package --dry-run` before packaging.
+
+# References
+

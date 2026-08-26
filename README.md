@@ -1,96 +1,69 @@
-# DSP Speaker Embedding Experiment
+# DSP501: Noise-Robust Speaker Verification
 
-## Introduction
+This is a reproducible study package for text-independent speaker verification with a SpeechBrain ECAPA-TDNN encoder. It asks whether an offline DSP front end improves verification of VCTK utterances mixed with deterministic composite MUSAN noise.
 
-This is a school project that obey the requirements in [this doc.](/project_requirements/DSP501_Final_Assignment%20Jul%202026.docx.pdf). 
+The primary comparison uses the same source clips, noise provenance, and balanced verification pairs for every condition and seed. No test-set threshold is selected: each pipeline/seed threshold is calibrated on validation pairs and then fixed for all test SNRs.
 
-This project fine-tunes the same pretrained ECAPA-TDNN speaker encoder under three controlled conditions:
+## Study protocol
 
-1. `clean_baseline`: clean VCTK audio.
-2. `noisy`: VCTK mixed with deterministic composite MUSAN noise.
-3. `noisy_wiener`: the same composite noisy VCTK segments processed by high-pass, low-pass, then SciPy Wiener filtering.
+The versioned study definition is [configs/dsp501-v1.json](configs/dsp501-v1.json). It fixes 3-second clips, 50 deterministic clips per speaker, speaker-disjoint 80/10/10 splits, seeds `11/22/33`, and test SNRs `5/10/15/20 dB`.
 
-The encoder returns L2-normalized speaker embeddings. Two utterances are compared with cosine similarity: larger values mean more similar voices. The product-facing score may display `(cosine + 1) / 2 * 100` as a similarity index; it is not a calibrated probability.
+| Condition | Input transform |
+| --- | --- |
+| `clean_reference` | Clean 16 kHz speech ceiling/reference |
+| `raw_noisy` | Composite MUSAN noise only |
+| `high_pass` | Noise + 80 Hz high-pass |
+| `high_pass_low_pass` | Noise + 80 Hz high-pass + 7.5 kHz low-pass |
+| `full_dsp` | Noise + both filters + Wiener filter (window 29) |
 
-## Signal Chain
+The filters are zero-phase Butterworth filters, so this is an offline method; it is not presented as deployable streaming enhancement. ECAPA receives mono 16 kHz waveform input, with the model-observable band ending at 8 kHz.
 
-VCTK `wav48` is the clean source at 48 kHz. The ECAPA checkpoint expects mono 16 kHz, so the dataset loader resamples before model input. The source and model Nyquist frequencies are therefore $24\,\text{kHz}$ and $8\,\text{kHz}$ respectively. All experiment noise, analysis, DSP cutoffs, and model claims after resampling are limited to the model-observable $0$-$8\,\text{kHz}$ band.
+DSP inspection utilities expose 512-point STFTs (160-sample hop), Welch PSD/band power, 40-coefficient MFCCs over 80 mel bands, residual SNR, and ECAPA’s internal filterbank frames. The DSP-only reference summarizes MFCC frames by coefficient mean and standard deviation, L2-normalizes the vector, and scores pairs by cosine similarity.
 
-The familiar $20$-$20{,}000\,\text{Hz}$ range describes typical human hearing, not the required input bandwidth for speaker embeddings. This experiment does not claim a particular microphone response; it distinguishes the VCTK source bandwidth from the model's 16 kHz input bandwidth.
-
-Each noisy segment is a deterministic composite of three separately selected MUSAN `noise` files:
-
-- `environmental`: raw MUSAN noise.
-- `low_band`: MUSAN noise band-limited to $20$-$300\,\text{Hz}$.
-- `high_band`: MUSAN noise band-limited to $3000$-$7500\,\text{Hz}$.
-
-The configured SNR ($5$, $10$, $15$, or $20\,\text{dB}$) applies to the **total composite noise**, not to every component. Components receive equal nominal power and the summed waveform is RMS-corrected to the selected total SNR.
-
-For `noisy_wiener`, DSP is applied offline in this fixed order:
-
-$$
-	ext{high-pass }80\,\text{Hz}
-\rightarrow
-	ext{low-pass }7500\,\text{Hz}
-\rightarrow
-	ext{local Wiener filter}.
-$$
-
-The $7.5$-$8\,\text{kHz}$ interval is a guard band below model Nyquist. The Butterworth filters use zero-phase SciPy SOS filtering; phase 2 and phase 3 start with identical raw composite noisy waveforms.
-
-## Setup
+## Setup and data
 
 ```bash
 uv sync
-uv run jupyter lab main.ipynb
+uv run python run.py download-data --accept-data-licenses
 ```
 
-Place the datasets in this layout:
+The download command is intentionally opt-in. It checks archive MD5s, rejects unsafe archive paths, extracts only VCTK 0.92 `wav48_silence_trimmed` `mic1` FLAC and MUSAN `noise` content, and validates the expected layout. Read the licenses and citations first: [VCTK 0.92](https://datashare.ed.ac.uk/items/30e7453c-9ea8-48b4-8e18-f96d0dc62928/full), [MUSAN / SLR17](https://www.openslr.org/17/).
 
-```text
-dataset/
-	VCTK-Corpus/
-		wav48/
-			p225/
-				p225_001.wav
-	musan/
-		noise/
-			free-sound/
-				... audio files ...
+## Run
+
+`run.py` is the canonical workflow. The related delivery artifacts have distinct roles:
+
+| Artifact | Role |
+| --- | --- |
+| `run.py` | Canonical, versioned study execution and artifact generation. |
+| `main.ipynb` | Technical dashboard and CLI orchestrator; it only reads saved artifacts for reporting. |
+| `report.qmd` | Final Quarto delivery document; it embeds the completed saved figures and fails clearly if they are absent. |
+
+```bash
+uv run python run.py prepare
+uv run python run.py tune
+uv run python run.py train
+uv run python run.py evaluate
+uv run python run.py analyze
+uv run python run.py package
 ```
 
-VCTK can be downloaded from the link in [dataset/README.md](dataset/README.md). Download MUSAN separately and keep the `noise` subset under `dataset/musan/noise`. Use only data that is permitted by its respective license.
+`tune` runs the required `raw_noisy` grid of learning rate `{3e-5, 1e-4}` and encoder-freeze epochs `{0, 1}`, selects lowest validation EER, and records the locked values in `outputs/<study-id>/tuning.json`. All seeds and ablations use that result. `all` runs the complete sequence.
 
-## Run Experiment
+Evaluation reports ROC-AUC, EER, accuracy, precision, recall, F1, and `tn/fp/fn/tp`; error entries retain score, threshold margin, source IDs, SNR, residual-SNR, and MFCC diagnostics. Analysis emits machine-readable JSON/CSV, SNR curves, and paired stratified-bootstrap 95% CIs for full-DSP minus raw-noisy F1. The release command creates an ignored `release/<study-id>/` bundle with source/config/lock files, checkpoints and reports when present, optional ECAPA cache, and a SHA-256 manifest; raw datasets are deliberately excluded.
 
-Open [main.ipynb](main.ipynb) after the datasets are in place. It is the primary workflow and includes cells to:
-
-1. Explain VCTK source sampling, model sampling, Nyquist, and anti-aliasing before processing data.
-2. Check the VCTK and MUSAN layout, then set seed, paths, SNR, bands, and DSP cutoffs in one place.
-3. Create reusable speaker-disjoint manifests.
-4. Analyze one held-out segment from 48 kHz source through 16 kHz model input, three noise components, composite mixture, high-pass, low-pass, and Wiener stages.
-5. Plot waveform, Welch PSD, STFT, band-energy, filter-response, component provenance, and stage-by-stage residual-SNR evidence before training.
-6. Fine-tune the clean, noisy, and noisy-Wiener conditions from the same ECAPA checkpoint.
-7. Evaluate all checkpoints on shared composite-noisy test audio, then evaluate the clean baseline on clean test as a separate reference.
-8. Plot verification and HDBSCAN metrics across the three noisy-test conditions.
-
-The first training cell downloads the SpeechBrain checkpoint into `pretrained_models/spkrec-ecapa-voxceleb`. Checkpoints and reports are written under `outputs/<condition>/`.
-
-## Results
-
-Each evaluation writes `outputs/<condition>/evaluation-*.json` with:
-
-- `roc_auc`, `eer`, and threshold-based verification `accuracy` for same/different speaker pairs.
-- HDBSCAN `ari`, `nmi`, `v_measure`, `clustered_coverage`, and `outlier_rate` against held-out speaker labels.
-
-Lower EER and higher ROC-AUC, ARI, NMI, V-measure, and coverage are better. HDBSCAN is supporting evidence only; use the verification metrics for the primary claim that Wiener training/inference improves over the raw-noisy condition and approaches the separate clean reference.
-
-The notebook's signal-level charts report residual SNR relative to the paired clean 16 kHz waveform after each stage. A positive final-DSP minus composite-noisy SNR delta indicates that the complete DSP chain is closer to clean for that inspected segment. Inspect the PSD and spectrogram too: band filtering or Wiener smoothing can suppress speaker-relevant speech detail along with noise.
-
-## Validation
+Run the offline tests with:
 
 ```bash
 uv run pytest -q
 ```
 
-The tests cover deterministic speaker-disjoint manifests, waveform length/finiteness, ECAPA embedding normalization, cosine-pair evaluation, and HDBSCAN result fields.
+After a completed run, render the final report (HTML or PDF) with Quarto:
+
+```bash
+quarto render report.qmd
+```
+
+The HTML target uses embedded resources for a portable delivery file. Before submission, replace the ethics and AI-use declaration placeholders in `report.qmd` with the required course-specific statements.
+
+Research-protocol, ethics/AI-declaration, and literature-matrix inputs should accompany a submitted report. This repository supplies the reproducible experiment rather than a completed paper or literature review.

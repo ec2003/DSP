@@ -20,13 +20,16 @@ from src.audio import (
     HighPassFilter,
     LowPassFilter,
     WienerDenoiser,
+    mfcc_features,
+    residual_snr_db,
 )
-from src.config.settings import ExperimentConfig
+from src.config.settings import ExperimentConfig, PROJECT_ROOT
 from src.data import ManifestRecord, VCTKWaveformDataset, build_manifests, load_manifest
 from src.data.vctk import WaveformTransform
 from src.experiments.evaluate import (
     build_verification_pairs,
     clustering_metrics,
+    pair_errors,
     score_pairs,
     verification_metrics,
 )
@@ -55,6 +58,8 @@ def prepare_manifests(config: ExperimentConfig) -> dict[str, Path]:
         segment_seconds=config.segment_seconds,
         train_ratio=config.train_ratio,
         validation_ratio=config.validation_ratio,
+        clips_per_speaker=config.clips_per_speaker,
+        dataset_root=PROJECT_ROOT,
     )
 
 
@@ -94,6 +99,7 @@ def train_condition(
         source=config.ecapa_source,
         cache_dir=config.ecapa_cache,
         device=device,
+        revision=config.ecapa_revision,
     )
     model.set_embedding_trainable(config.freeze_encoder_epochs == 0)
     loss_function = ArcFaceLoss(
@@ -124,7 +130,7 @@ def train_condition(
 
         validation_embeddings = _extract_embeddings(model, validation_loader, device)
         scores, targets = score_pairs(
-            build_verification_pairs(validation_records, seed=config.seed),
+            build_verification_pairs(validation_records, seed=config.seed, positive_pairs_per_speaker=config.positive_pairs_per_speaker),
             validation_embeddings,
         )
         validation_result = verification_metrics(scores, targets)
@@ -149,11 +155,12 @@ def evaluate_checkpoint(
     checkpoint_path: Path,
     *,
     clean_reference: bool = False,
+    test_snr_db: int | None = None,
     min_cluster_size: int = 2,
     min_samples: int | None = None,
     device: torch.device | None = None,
 ) -> EvaluationResult:
-    """Evaluate a checkpoint on shared noisy test data or the clean reference protocol."""
+    """Evaluate with a validation-calibrated threshold, never a test-calibrated one."""
     _seed_everything(config.seed)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_records = load_manifest(config.manifest_root / "test.jsonl")
@@ -162,30 +169,32 @@ def evaluate_checkpoint(
         sample_rate=config.sample_rate,
         segment_seconds=config.segment_seconds,
         waveform_transform=build_waveform_transform(
-            config, force_noisy=not clean_reference
+            config, force_noisy=not clean_reference, fixed_snr_db=test_snr_db
         ),
+        dataset_root=PROJECT_ROOT,
     )
     model = EcapaSpeakerEncoder.from_pretrained(
         source=config.ecapa_source,
         cache_dir=config.ecapa_cache,
         device=device,
+        revision=config.ecapa_revision,
     )
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state"])
     embeddings = _extract_embeddings(
         model, DataLoader(test_dataset, batch_size=config.batch_size), device
     )
-    scores, targets = score_pairs(
-        build_verification_pairs(test_records, seed=config.seed), embeddings
-    )
-    verification = verification_metrics(scores, targets)
+    diagnostics = _diagnostics_for_dataset(config, test_records, test_dataset, test_snr_db)
+    pairs = build_verification_pairs(test_records, seed=config.seed, positive_pairs_per_speaker=config.positive_pairs_per_speaker)
+    scores, targets = score_pairs(pairs, embeddings)
+    verification = verification_metrics(scores, targets, threshold=float(checkpoint["validation"]["threshold"]))
     clustering = clustering_metrics(
         embeddings,
         test_records,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
     )
-    protocol = "clean_reference" if clean_reference else "shared_noisy_test"
+    protocol = "clean_reference" if clean_reference else f"test-snr-{test_snr_db if test_snr_db is not None else 'balanced'}"
     report_path = config.run_root / f"evaluation-{protocol}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -194,6 +203,11 @@ def evaluate_checkpoint(
                 "condition": config.condition,
                 "protocol": protocol,
                 "checkpoint": str(checkpoint_path),
+                "test_snr_db": test_snr_db,
+                "pair_ids": [pair.pair_id for pair in pairs],
+                "scores": scores.tolist(),
+                "labels": targets.tolist(),
+                "errors": pair_errors(pairs, scores, targets, threshold=float(verification["threshold"]), diagnostics=diagnostics),
                 "verification": verification,
                 "clustering": clustering,
             },
@@ -213,11 +227,12 @@ def _dataset_for_records(
         sample_rate=config.sample_rate,
         segment_seconds=config.segment_seconds,
         waveform_transform=build_waveform_transform(config),
+        dataset_root=PROJECT_ROOT,
     )
 
 
 def build_waveform_transform(
-    config: ExperimentConfig, *, force_noisy: bool = False
+    config: ExperimentConfig, *, force_noisy: bool = False, fixed_snr_db: int | None = None
 ) -> WaveformTransform | None:
     if not (config.needs_noise or force_noisy):
         return None
@@ -234,18 +249,19 @@ def build_waveform_transform(
         high_noise_band_hz=config.high_noise_band_hz,
         filter_order=config.filter_order,
     )
-    dsp_chain = (
-        DspTransformChain(
-            HighPassFilter(config.high_pass_hz, config.filter_order),
-            LowPassFilter(config.low_pass_hz, config.filter_order),
-            WienerDenoiser(config.wiener_window_size),
-        )
-        if config.needs_wiener
-        else None
-    )
+    transforms = []
+    if "high_pass" in config.stages:
+        transforms.append(HighPassFilter(config.high_pass_hz, config.filter_order))
+    if "low_pass" in config.stages:
+        transforms.append(LowPassFilter(config.low_pass_hz, config.filter_order))
+    if "wiener" in config.stages:
+        transforms.append(WienerDenoiser(config.wiener_window_size))
+    dsp_chain = DspTransformChain(*transforms) if transforms else None
 
     def transform(waveform: Tensor, sample_rate: int, record: ManifestRecord) -> Tensor:
-        noisy_waveform = mixer(waveform, sample_rate, record)
+        noise = mixer.build_noise(record, sample_rate=sample_rate, target_length=waveform.numel(), snr_db=fixed_snr_db)
+        from src.audio.noise import mix_at_snr
+        noisy_waveform = mix_at_snr(waveform, noise.composite, noise.snr_db)
         return (
             dsp_chain(noisy_waveform, sample_rate, record)
             if dsp_chain is not None
@@ -267,6 +283,25 @@ def _extract_embeddings(
             batch_embeddings = model(_waveforms(batch, device)).cpu()
             embeddings.update(zip(batch["sample_id"], batch_embeddings, strict=True))
     return embeddings
+
+
+def _diagnostics_for_dataset(
+    config: ExperimentConfig,
+    records: list[ManifestRecord],
+    processed_dataset: VCTKWaveformDataset,
+    test_snr_db: int | None,
+) -> dict[str, dict[str, object]]:
+    """Compact per-utterance diagnostics retained only when a pair is an error."""
+    clean_dataset = VCTKWaveformDataset(records, sample_rate=config.sample_rate, segment_seconds=config.segment_seconds, dataset_root=PROJECT_ROOT)
+    output: dict[str, dict[str, object]] = {}
+    for index, record in enumerate(records):
+        clean = clean_dataset[index]["waveform"]
+        processed = processed_dataset[index]["waveform"]
+        if not isinstance(clean, Tensor) or not isinstance(processed, Tensor):
+            raise TypeError("dataset waveform contract violated")
+        mfcc = mfcc_features(processed, sample_rate=config.sample_rate, n_mfcc=config.mfcc_coefficients, n_mels=config.mel_bins)
+        output[record.sample_id] = {"source_id": record.sample_id, "audio_path": record.audio_path, "snr_db": test_snr_db, "residual_snr_db": residual_snr_db(clean, processed), "mfcc_mean": [round(float(value), 6) for value in mfcc.mean(dim=1)]}
+    return output
 
 
 def _waveforms(batch: dict[str, Any], device: torch.device) -> Tensor:

@@ -34,6 +34,8 @@ def build_manifests(
     segment_seconds: float,
     train_ratio: float = 0.8,
     validation_ratio: float = 0.1,
+    clips_per_speaker: int = 50,
+    dataset_root: Path | None = None,
 ) -> dict[str, Path]:
     """Create reproducible speaker-disjoint VCTK manifests."""
     if (
@@ -66,7 +68,10 @@ def build_manifests(
     manifest_root.mkdir(parents=True, exist_ok=True)
     manifest_paths: dict[str, Path] = {}
     for split, split_speakers in speaker_splits.items():
-        records = _records_for_speakers(split_speakers, split, seed, segment_seconds)
+        records = _records_for_speakers(
+            split_speakers, split, seed, segment_seconds,
+            clips_per_speaker=clips_per_speaker, dataset_root=dataset_root or Path.cwd(),
+        )
         manifest_path = manifest_root / f"{split}.jsonl"
         manifest_path.write_text(
             "".join(
@@ -96,18 +101,23 @@ class VCTKWaveformDataset(Dataset[dict[str, str | Tensor]]):
         sample_rate: int,
         segment_seconds: float,
         waveform_transform: WaveformTransform | None = None,
+        dataset_root: Path | None = None,
     ) -> None:
         self.records = list(records)
         self.sample_rate = sample_rate
         self.segment_samples = round(sample_rate * segment_seconds)
         self.waveform_transform = waveform_transform
+        self.dataset_root = dataset_root or Path.cwd()
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, str | Tensor]:
         record = self.records[index]
-        waveform, source_sample_rate = torchaudio.load(record.audio_path)
+        audio_path = Path(record.audio_path)
+        waveform, source_sample_rate = torchaudio.load(
+            audio_path if audio_path.is_absolute() else self.dataset_root / audio_path
+        )
         waveform = waveform.mean(dim=0)
         if source_sample_rate != self.sample_rate:
             waveform = torchaudio.functional.resample(
@@ -135,15 +145,26 @@ def _records_for_speakers(
     split: str,
     seed: int,
     segment_seconds: float,
+    *,
+    clips_per_speaker: int,
+    dataset_root: Path,
 ) -> list[ManifestRecord]:
     records: list[ManifestRecord] = []
     for speaker_dir in speakers:
-        for audio_path in sorted(speaker_dir.rglob("*.wav")):
+        # VCTK 0.92 supplies FLAC mic1 recordings; WAV remains supported for fixtures.
+        source_files = sorted(
+            path for path in speaker_dir.rglob("*")
+            if path.suffix.lower() in {".flac", ".wav"} and (path.suffix.lower() != ".flac" or "mic1" in path.name)
+        )
+        if not source_files:
+            continue
+        for clip_index in range(clips_per_speaker):
+            audio_path = source_files[_deterministic_file_index(speaker_dir.name, clip_index, seed, len(source_files))]
             waveform, sample_rate = torchaudio.load(audio_path)
             if sample_rate <= 0:
                 raise ValueError(f"Invalid sample rate for {audio_path}")
             duration_seconds = waveform.shape[-1] / sample_rate
-            sample_id = f"{speaker_dir.name}/{audio_path.stem}"
+            sample_id = f"{speaker_dir.name}/{audio_path.stem}/clip-{clip_index:03d}"
             crop_start_seconds = _deterministic_crop_start(
                 sample_id,
                 duration_seconds,
@@ -154,13 +175,18 @@ def _records_for_speakers(
                 ManifestRecord(
                     sample_id=sample_id,
                     speaker_id=speaker_dir.name,
-                    audio_path=str(audio_path.resolve()),
+                    audio_path=str(audio_path.relative_to(dataset_root) if audio_path.is_relative_to(dataset_root) else Path(__import__("os").path.relpath(audio_path, dataset_root))),
                     split=split,
                     duration_seconds=duration_seconds,
                     crop_start_seconds=crop_start_seconds,
                 )
             )
     return records
+
+
+def _deterministic_file_index(speaker_id: str, clip_index: int, seed: int, size: int) -> int:
+    digest = sha256(f"{seed}:{speaker_id}:{clip_index}:file".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % size
 
 
 def _deterministic_crop_start(
