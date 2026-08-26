@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 import tarfile
 import urllib.request
 import zipfile
-
+from pathlib import Path
 
 # The item page is an HTML application; download the official VCTK archive bitstream instead.
 VCTK_URL = "https://datashare.ed.ac.uk/bitstreams/535f4286-e54c-4038-838c-a02285e32cb2/download"
@@ -24,15 +23,21 @@ def file_md5(path: Path) -> str:
     return digest.hexdigest()
 
 
-def safe_extract_archive(archive: Path, destination: Path, *, required_prefixes: tuple[str, ...] = ()) -> None:
+def safe_extract_archive(
+    archive: Path, destination: Path, *, required_prefixes: tuple[str, ...] = ()
+) -> None:
     """Extract only safe members, optionally restricting extraction to needed paths."""
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
+
     def allowed(name: str) -> bool:
         clean = Path(name)
         if clean.is_absolute() or ".." in clean.parts:
             raise ValueError(f"Unsafe archive member: {name}")
-        return not required_prefixes or any(name.startswith(prefix) for prefix in required_prefixes)
+        return not required_prefixes or any(
+            name.startswith(prefix) for prefix in required_prefixes
+        )
+
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zipped:
             for member in zipped.infolist():
@@ -53,18 +58,37 @@ def safe_extract_archive(archive: Path, destination: Path, *, required_prefixes:
                     tarred.extract(member, destination, filter="data")
 
 
-def download_datasets(dataset_root: Path, *, accept_data_licenses: bool) -> dict[str, Path]:
+def download_datasets(
+    dataset_root: Path, *, accept_data_licenses: bool
+) -> dict[str, Path]:
     if not accept_data_licenses:
-        raise PermissionError("Pass --accept-data-licenses after reviewing VCTK and MUSAN licenses.")
+        raise PermissionError(
+            "Pass --accept-data-licenses after reviewing VCTK and MUSAN licenses."
+        )
     dataset_root.mkdir(parents=True, exist_ok=True)
-    archives = {"vctk": (VCTK_URL, VCTK_MD5, dataset_root / "VCTK-Corpus-0.92.zip", ("VCTK-Corpus-0.92/wav48_silence_trimmed/", "VCTK-Corpus-0.92/COPYING")), "musan": (MUSAN_URL, MUSAN_MD5, dataset_root / "musan.tar.gz", ("musan/noise/",))}
+    archives = {
+        "vctk": (
+            VCTK_URL,
+            VCTK_MD5,
+            dataset_root / "VCTK-Corpus-0.92.zip",
+            ("VCTK-Corpus-0.92/wav48_silence_trimmed/", "VCTK-Corpus-0.92/COPYING"),
+        ),
+        "musan": (
+            MUSAN_URL,
+            MUSAN_MD5,
+            dataset_root / "musan.tar.gz",
+            ("musan/noise/",),
+        ),
+    }
     completed: dict[str, Path] = {}
     for name, (url, checksum, archive, prefixes) in archives.items():
         if not archive.exists():
             urllib.request.urlretrieve(url, archive)
         actual = file_md5(archive)
         if actual != checksum:
-            raise ValueError(f"Checksum mismatch for {archive.name}: expected {checksum}, got {actual}")
+            raise ValueError(
+                f"Checksum mismatch for {archive.name}: expected {checksum}, got {actual}"
+            )
         safe_extract_archive(archive, dataset_root, required_prefixes=prefixes)
         completed[name] = archive
     validate_dataset_layout(dataset_root)
@@ -80,5 +104,7 @@ def validate_dataset_layout(dataset_root: Path) -> None:
     mic1 = list(vctk.glob("p*/*_mic1.flac")) if vctk.is_dir() else []
     if not mic1:
         raise FileNotFoundError(f"Expected VCTK 0.92 mic1 FLAC files below {vctk}")
-    if not any(path.suffix.lower() in {".wav", ".flac"} for path in musan_noise.rglob("*")):
+    if not any(
+        path.suffix.lower() in {".wav", ".flac"} for path in musan_noise.rglob("*")
+    ):
         raise FileNotFoundError(f"Expected MUSAN noise audio below {musan_noise}")

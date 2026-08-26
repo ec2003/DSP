@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
 import torch
+from scipy.signal import butter, sosfiltfilt
 from torch import Tensor
 
 from src.data.vctk import ManifestRecord

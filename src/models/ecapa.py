@@ -56,13 +56,19 @@ class EcapaSpeakerEncoder(nn.Module):
         embeddings = embeddings.squeeze(1)
         return functional.normalize(embeddings, p=2, dim=-1)
 
-    def filterbank_features(self, waveforms: Tensor, lengths: Tensor | None = None) -> Tensor:
+    def filterbank_features(
+        self, waveforms: Tensor, lengths: Tensor | None = None
+    ) -> Tensor:
         """Expose ECAPA's internal filterbank frames for diagnostic plots only."""
         if waveforms.ndim == 1:
             waveforms = waveforms.unsqueeze(0)
         if waveforms.ndim != 2:
             raise ValueError("ECAPA expects waveforms with shape [batch, time]")
-        lengths = lengths if lengths is not None else torch.ones(waveforms.shape[0], device=waveforms.device)
+        lengths = (
+            lengths
+            if lengths is not None
+            else torch.ones(waveforms.shape[0], device=waveforms.device)
+        )
         return self.mean_var_norm(self.compute_features(waveforms), lengths)
 
     def set_embedding_trainable(self, trainable: bool) -> None:

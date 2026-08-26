@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import json
-from pathlib import Path
 import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from pytorch_metric_learning.samplers import MPerClassSampler
-import torch
 from torch import Tensor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -23,7 +23,7 @@ from src.audio import (
     mfcc_features,
     residual_snr_db,
 )
-from src.config.settings import ExperimentConfig, PROJECT_ROOT
+from src.config.settings import PROJECT_ROOT, ExperimentConfig
 from src.data import ManifestRecord, VCTKWaveformDataset, build_manifests, load_manifest
 from src.data.vctk import WaveformTransform
 from src.experiments.evaluate import (
@@ -130,7 +130,11 @@ def train_condition(
 
         validation_embeddings = _extract_embeddings(model, validation_loader, device)
         scores, targets = score_pairs(
-            build_verification_pairs(validation_records, seed=config.seed, positive_pairs_per_speaker=config.positive_pairs_per_speaker),
+            build_verification_pairs(
+                validation_records,
+                seed=config.seed,
+                positive_pairs_per_speaker=config.positive_pairs_per_speaker,
+            ),
             validation_embeddings,
         )
         validation_result = verification_metrics(scores, targets)
@@ -184,17 +188,29 @@ def evaluate_checkpoint(
     embeddings = _extract_embeddings(
         model, DataLoader(test_dataset, batch_size=config.batch_size), device
     )
-    diagnostics = _diagnostics_for_dataset(config, test_records, test_dataset, test_snr_db)
-    pairs = build_verification_pairs(test_records, seed=config.seed, positive_pairs_per_speaker=config.positive_pairs_per_speaker)
+    diagnostics = _diagnostics_for_dataset(
+        config, test_records, test_dataset, test_snr_db
+    )
+    pairs = build_verification_pairs(
+        test_records,
+        seed=config.seed,
+        positive_pairs_per_speaker=config.positive_pairs_per_speaker,
+    )
     scores, targets = score_pairs(pairs, embeddings)
-    verification = verification_metrics(scores, targets, threshold=float(checkpoint["validation"]["threshold"]))
+    verification = verification_metrics(
+        scores, targets, threshold=float(checkpoint["validation"]["threshold"])
+    )
     clustering = clustering_metrics(
         embeddings,
         test_records,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
     )
-    protocol = "clean_reference" if clean_reference else f"test-snr-{test_snr_db if test_snr_db is not None else 'balanced'}"
+    protocol = (
+        "clean_reference"
+        if clean_reference
+        else f"test-snr-{test_snr_db if test_snr_db is not None else 'balanced'}"
+    )
     report_path = config.run_root / f"evaluation-{protocol}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -207,7 +223,13 @@ def evaluate_checkpoint(
                 "pair_ids": [pair.pair_id for pair in pairs],
                 "scores": scores.tolist(),
                 "labels": targets.tolist(),
-                "errors": pair_errors(pairs, scores, targets, threshold=float(verification["threshold"]), diagnostics=diagnostics),
+                "errors": pair_errors(
+                    pairs,
+                    scores,
+                    targets,
+                    threshold=float(verification["threshold"]),
+                    diagnostics=diagnostics,
+                ),
                 "verification": verification,
                 "clustering": clustering,
             },
@@ -232,7 +254,10 @@ def _dataset_for_records(
 
 
 def build_waveform_transform(
-    config: ExperimentConfig, *, force_noisy: bool = False, fixed_snr_db: int | None = None
+    config: ExperimentConfig,
+    *,
+    force_noisy: bool = False,
+    fixed_snr_db: int | None = None,
 ) -> WaveformTransform | None:
     if not (config.needs_noise or force_noisy):
         return None
@@ -259,8 +284,14 @@ def build_waveform_transform(
     dsp_chain = DspTransformChain(*transforms) if transforms else None
 
     def transform(waveform: Tensor, sample_rate: int, record: ManifestRecord) -> Tensor:
-        noise = mixer.build_noise(record, sample_rate=sample_rate, target_length=waveform.numel(), snr_db=fixed_snr_db)
+        noise = mixer.build_noise(
+            record,
+            sample_rate=sample_rate,
+            target_length=waveform.numel(),
+            snr_db=fixed_snr_db,
+        )
         from src.audio.noise import mix_at_snr
+
         noisy_waveform = mix_at_snr(waveform, noise.composite, noise.snr_db)
         return (
             dsp_chain(noisy_waveform, sample_rate, record)
@@ -292,15 +323,31 @@ def _diagnostics_for_dataset(
     test_snr_db: int | None,
 ) -> dict[str, dict[str, object]]:
     """Compact per-utterance diagnostics retained only when a pair is an error."""
-    clean_dataset = VCTKWaveformDataset(records, sample_rate=config.sample_rate, segment_seconds=config.segment_seconds, dataset_root=PROJECT_ROOT)
+    clean_dataset = VCTKWaveformDataset(
+        records,
+        sample_rate=config.sample_rate,
+        segment_seconds=config.segment_seconds,
+        dataset_root=PROJECT_ROOT,
+    )
     output: dict[str, dict[str, object]] = {}
     for index, record in enumerate(records):
         clean = clean_dataset[index]["waveform"]
         processed = processed_dataset[index]["waveform"]
         if not isinstance(clean, Tensor) or not isinstance(processed, Tensor):
             raise TypeError("dataset waveform contract violated")
-        mfcc = mfcc_features(processed, sample_rate=config.sample_rate, n_mfcc=config.mfcc_coefficients, n_mels=config.mel_bins)
-        output[record.sample_id] = {"source_id": record.sample_id, "audio_path": record.audio_path, "snr_db": test_snr_db, "residual_snr_db": residual_snr_db(clean, processed), "mfcc_mean": [round(float(value), 6) for value in mfcc.mean(dim=1)]}
+        mfcc = mfcc_features(
+            processed,
+            sample_rate=config.sample_rate,
+            n_mfcc=config.mfcc_coefficients,
+            n_mels=config.mel_bins,
+        )
+        output[record.sample_id] = {
+            "source_id": record.sample_id,
+            "audio_path": record.audio_path,
+            "snr_db": test_snr_db,
+            "residual_snr_db": residual_snr_db(clean, processed),
+            "mfcc_mean": [round(float(value), 6) for value in mfcc.mean(dim=1)],
+        }
     return output
 
 

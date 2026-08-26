@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
 import json
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ConditionName = Literal["clean_reference", "raw_noisy", "high_pass", "high_pass_low_pass", "full_dsp"]
-_LEGACY_CONDITIONS = {"clean_baseline": "clean_reference", "noisy": "raw_noisy", "noisy_wiener": "full_dsp"}
+ConditionName = Literal[
+    "clean_reference", "raw_noisy", "high_pass", "high_pass_low_pass", "full_dsp"
+]
+_LEGACY_CONDITIONS = {
+    "clean_baseline": "clean_reference",
+    "noisy": "raw_noisy",
+    "noisy_wiener": "full_dsp",
+}
 
 
 @dataclass(frozen=True)
@@ -47,7 +52,9 @@ class ExperimentConfig:
     mel_bins: int = 80
     train_ratio: float = 0.8
     validation_ratio: float = 0.1
-    vctk_root: Path = PROJECT_ROOT / "dataset" / "VCTK-Corpus-0.92" / "wav48_silence_trimmed"
+    vctk_root: Path = (
+        PROJECT_ROOT / "dataset" / "VCTK-Corpus-0.92" / "wav48_silence_trimmed"
+    )
     musan_root: Path = PROJECT_ROOT / "dataset" / "musan"
     output_root: Path = PROJECT_ROOT / "outputs"
     ecapa_source: str = "speechbrain/spkrec-ecapa-voxceleb"
@@ -57,22 +64,43 @@ class ExperimentConfig:
     def __post_init__(self) -> None:
         condition = _LEGACY_CONDITIONS.get(str(self.condition), self.condition)
         object.__setattr__(self, "condition", condition)
-        if condition not in {"clean_reference", "raw_noisy", "high_pass", "high_pass_low_pass", "full_dsp"}:
+        if condition not in {
+            "clean_reference",
+            "raw_noisy",
+            "high_pass",
+            "high_pass_low_pass",
+            "full_dsp",
+        }:
             raise ValueError(f"Unsupported condition: {condition}")
         if self.source_sample_rate < self.sample_rate:
             raise ValueError("source_sample_rate must be at least sample_rate")
         if self.clips_per_speaker < 2 or self.positive_pairs_per_speaker < 1:
-            raise ValueError("clips_per_speaker must be at least 2 and pair count positive")
+            raise ValueError(
+                "clips_per_speaker must be at least 2 and pair count positive"
+            )
         if not self.snr_db or any(snr <= 0 for snr in self.snr_db):
             raise ValueError("snr_db must contain positive target SNR values")
-        if len(self.noise_components) != 3 or set(self.noise_components) != {"environmental", "low_band", "high_band"}:
-            raise ValueError("noise_components must be environmental, low_band, high_band")
-        for name, band in (("low_noise_band_hz", self.low_noise_band_hz), ("high_noise_band_hz", self.high_noise_band_hz)):
+        if len(self.noise_components) != 3 or set(self.noise_components) != {
+            "environmental",
+            "low_band",
+            "high_band",
+        }:
+            raise ValueError(
+                "noise_components must be environmental, low_band, high_band"
+            )
+        for name, band in (
+            ("low_noise_band_hz", self.low_noise_band_hz),
+            ("high_noise_band_hz", self.high_noise_band_hz),
+        ):
             if not 0 < band[0] < band[1] < self.nyquist_hz:
                 raise ValueError(f"{name} must lie below model Nyquist")
         if not 0 < self.high_pass_hz < self.low_pass_hz < self.nyquist_hz:
             raise ValueError("DSP passband must be ordered and lie below model Nyquist")
-        if self.filter_order < 1 or self.wiener_window_size < 3 or self.wiener_window_size % 2 == 0:
+        if (
+            self.filter_order < 1
+            or self.wiener_window_size < 3
+            or self.wiener_window_size % 2 == 0
+        ):
             raise ValueError("invalid filter order or Wiener window")
 
     @property
@@ -89,7 +117,9 @@ class ExperimentConfig:
 
     @property
     def run_root(self) -> Path:
-        return self.output_root / self.study_id / f"seed-{self.seed}" / str(self.condition)
+        return (
+            self.output_root / self.study_id / f"seed-{self.seed}" / str(self.condition)
+        )
 
     @property
     def needs_noise(self) -> bool:
@@ -102,16 +132,26 @@ class ExperimentConfig:
 
     @property
     def stages(self) -> tuple[str, ...]:
-        return {"clean_reference": (), "raw_noisy": (), "high_pass": ("high_pass",), "high_pass_low_pass": ("high_pass", "low_pass"), "full_dsp": ("high_pass", "low_pass", "wiener")}[self.condition]
+        return {
+            "clean_reference": (),
+            "raw_noisy": (),
+            "high_pass": ("high_pass",),
+            "high_pass_low_pass": ("high_pass", "low_pass"),
+            "full_dsp": ("high_pass", "low_pass", "wiener"),
+        }[self.condition]
 
-    def with_seed(self, seed: int) -> "ExperimentConfig":
+    def with_seed(self, seed: int) -> ExperimentConfig:
         return ExperimentConfig(**{**asdict(self), "seed": seed})
 
     def to_dict(self, *, relative_to: Path = PROJECT_ROOT) -> dict[str, Any]:
         data = asdict(self)
         for key, value in data.items():
             if isinstance(value, Path):
-                data[key] = str(value.relative_to(relative_to) if value.is_relative_to(relative_to) else value)
+                data[key] = str(
+                    value.relative_to(relative_to)
+                    if value.is_relative_to(relative_to)
+                    else value
+                )
         return data
 
 
@@ -124,15 +164,21 @@ def load_config(path: Path | None = None, **overrides: Any) -> ExperimentConfig:
         for key in ("vctk_root", "musan_root", "output_root", "ecapa_cache"):
             if key in data:
                 candidate = Path(data[key])
-                data[key] = candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
+                data[key] = (
+                    candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
+                )
     data.update({key: value for key, value in overrides.items() if value is not None})
     valid = {field.name for field in fields(ExperimentConfig)}
-    return ExperimentConfig(**{key: value for key, value in data.items() if key in valid})
+    return ExperimentConfig(
+        **{key: value for key, value in data.items() if key in valid}
+    )
 
 
 def save_config(config: ExperimentConfig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def get_config(condition: ConditionName | str) -> ExperimentConfig:

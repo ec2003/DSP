@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import wiener
 import torch
+from scipy.signal import wiener
 from torch import Tensor
 
 from src.data.vctk import ManifestRecord

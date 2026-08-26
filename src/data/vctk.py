@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import json
+import random
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-import json
 from pathlib import Path
-import random
-from typing import Callable, Iterable
 
 import torch
+import torchaudio
 from torch import Tensor
 from torch.utils.data import Dataset
-import torchaudio
-
 
 WaveformTransform = Callable[[Tensor, int, "ManifestRecord"], Tensor]
 
@@ -69,8 +68,12 @@ def build_manifests(
     manifest_paths: dict[str, Path] = {}
     for split, split_speakers in speaker_splits.items():
         records = _records_for_speakers(
-            split_speakers, split, seed, segment_seconds,
-            clips_per_speaker=clips_per_speaker, dataset_root=dataset_root or Path.cwd(),
+            split_speakers,
+            split,
+            seed,
+            segment_seconds,
+            clips_per_speaker=clips_per_speaker,
+            dataset_root=dataset_root or Path.cwd(),
         )
         manifest_path = manifest_root / f"{split}.jsonl"
         manifest_path.write_text(
@@ -153,13 +156,19 @@ def _records_for_speakers(
     for speaker_dir in speakers:
         # VCTK 0.92 supplies FLAC mic1 recordings; WAV remains supported for fixtures.
         source_files = sorted(
-            path for path in speaker_dir.rglob("*")
-            if path.suffix.lower() in {".flac", ".wav"} and (path.suffix.lower() != ".flac" or "mic1" in path.name)
+            path
+            for path in speaker_dir.rglob("*")
+            if path.suffix.lower() in {".flac", ".wav"}
+            and (path.suffix.lower() != ".flac" or "mic1" in path.name)
         )
         if not source_files:
             continue
         for clip_index in range(clips_per_speaker):
-            audio_path = source_files[_deterministic_file_index(speaker_dir.name, clip_index, seed, len(source_files))]
+            audio_path = source_files[
+                _deterministic_file_index(
+                    speaker_dir.name, clip_index, seed, len(source_files)
+                )
+            ]
             waveform, sample_rate = torchaudio.load(audio_path)
             if sample_rate <= 0:
                 raise ValueError(f"Invalid sample rate for {audio_path}")
@@ -175,7 +184,13 @@ def _records_for_speakers(
                 ManifestRecord(
                     sample_id=sample_id,
                     speaker_id=speaker_dir.name,
-                    audio_path=str(audio_path.relative_to(dataset_root) if audio_path.is_relative_to(dataset_root) else Path(__import__("os").path.relpath(audio_path, dataset_root))),
+                    audio_path=str(
+                        audio_path.relative_to(dataset_root)
+                        if audio_path.is_relative_to(dataset_root)
+                        else Path(
+                            __import__("os").path.relpath(audio_path, dataset_root)
+                        )
+                    ),
                     split=split,
                     duration_seconds=duration_seconds,
                     crop_start_seconds=crop_start_seconds,
@@ -184,8 +199,10 @@ def _records_for_speakers(
     return records
 
 
-def _deterministic_file_index(speaker_id: str, clip_index: int, seed: int, size: int) -> int:
-    digest = sha256(f"{seed}:{speaker_id}:{clip_index}:file".encode("utf-8")).digest()
+def _deterministic_file_index(
+    speaker_id: str, clip_index: int, seed: int, size: int
+) -> int:
+    digest = sha256(f"{seed}:{speaker_id}:{clip_index}:file".encode()).digest()
     return int.from_bytes(digest[:8], "big") % size
 
 
@@ -195,6 +212,6 @@ def _deterministic_crop_start(
     available_seconds = max(0.0, duration_seconds - segment_seconds)
     if available_seconds == 0:
         return 0.0
-    digest = sha256(f"{seed}:{sample_id}".encode("utf-8")).digest()
+    digest = sha256(f"{seed}:{sample_id}".encode()).digest()
     fraction = int.from_bytes(digest[:8], "big") / (2**64 - 1)
     return available_seconds * fraction
