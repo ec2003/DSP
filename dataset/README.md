@@ -1,0 +1,1 @@
+Download dataset from [here](https://datashare.ed.ac.uk/bitstreams/535f4286-e54c-4038-838c-a02285e32cb2/download). Then save unzip it as `VCTK-Corpus`
