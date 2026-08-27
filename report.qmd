@@ -7,7 +7,24 @@ bibliography: references.bib
 csl: ieee.csl
 format:
   html: {embed-resources: true, toc: true, number-sections: true}
-  pdf: {toc: true, number-sections: true}
+  pdf:
+    toc: false
+    number-sections: true
+    documentclass: article
+    fontsize: 10pt
+    geometry: [top=2cm, bottom=2cm, left=2.1cm, right=2.1cm]
+    linestretch: 1.0
+    fig-pos: "htbp"
+    fig-align: center
+    out-width: "72%"
+    tbl-colwidths: auto
+    include-in-header:
+      text: |
+        \usepackage{caption}
+        \captionsetup{font=small, skip=3pt}
+        \setlength{\textfloatsep}{6pt}
+        \setlength{\intextsep}{6pt}
+        \setlength{\parskip}{2pt}
 execute: {echo: false, warning: false}
 ---
 
@@ -167,16 +184,17 @@ Ba quan sát rút ra từ phần trên. Thứ nhất, các công trình đạt c
 ```{mermaid}
 %%| label: fig-framework
 %%| fig-cap: "Khung nghiên cứu: từ vấn đề tới đánh giá. Chỉ khối DSP processing thay đổi giữa các điều kiện so sánh."
-flowchart TD
-  P["Research problem:<br/>DSP tại suy luận có giúp<br/>encoder đã robust?"] --> D["Dataset<br/>VCTK speech + MUSAN noise"]
+%%| out-width: "100%"
+flowchart LR
+  P["Research problem:<br/>DSP tại suy luận có giúp<br/>encoder đã robust?"] --> D["Dataset<br/>VCTK speech<br/>+ MUSAN noise"]
   D --> S["Sampling and quantization<br/>16 kHz; speaker-disjoint split;<br/>nhiễu chia theo recording"]
-  S --> T["Training branch<br/>augmentation MUSAN on-the-fly<br/>3 checkpoint CNN/ArcFace"]
-  S --> M["Mixture test cố định<br/>4 family x 5 SNR + clean"]
-  M --> F["DSP processing (bien doc lap)<br/>raw | bandpass | wiener | bandpass+wiener"]
+  S --> T["Training branch<br/>augmentation MUSAN<br/>3 checkpoint CNN/ArcFace"]
+  S --> M["Mixture test cố định<br/>4 family x 5 SNR<br/>+ clean"]
+  M --> F["DSP processing<br/>(bien doc lap)<br/>raw | bandpass |<br/>wiener | bandpass+wiener"]
   F --> X["Feature extraction<br/>STFT to log-mel 80 bang<br/>chuan hoa mean-variance"]
-  T -->|freeze| E["AI model<br/>CNN + attentive stat pooling<br/>embedding 192-D"]
+  T -->|freeze| E["AI model<br/>CNN + attentive<br/>stat pooling<br/>embedding 192-D"]
   X --> E
-  E --> V["Evaluation<br/>nearest-centroid unseen/seen<br/>accuracy, P/R/F1, confusion<br/>paired speaker bootstrap"]
+  E --> V["Evaluation<br/>nearest-centroid<br/>unseen/seen; P/R/F1;<br/>paired speaker bootstrap"]
 ```
 
 Chỉ một nhánh trong sơ đồ thay đổi giữa các điều kiện so sánh: khối *DSP processing*. Mọi thứ phía trước (mixture, seed, SNR, family) và phía sau (đặc trưng, checkpoint, enrollment, query) đều cố định.
@@ -261,7 +279,7 @@ fig("signal-gallery.png")
 
 Mô hình là CNN nhận log-mel với các khối tích chập, attentive statistics pooling và embedding 192 chiều đã L2-normalize, huấn luyện bằng ArcFace [@arcface]. ArcFace được chọn thay softmax thường vì margin góc trực tiếp tối ưu khoảng cách cosine — đúng độ đo dùng khi nhận dạng bằng nearest-centroid, nên hàm mất mát và giao thức suy luận nhất quán với nhau. Attentive statistics pooling cho phép mô hình hạ trọng số các khung bị nhiễu áp đảo thay vì lấy trung bình đều.
 
-**Grid search.** Learning rate và ArcFace margin được tìm kiếm trên lưới `{python} len(TUNING['search_space']['learning_rate'])`×`{python} len(TUNING['search_space']['arcface_margin'])`, mỗi trial huấn luyện `{python} TUNING['protocol']['epochs_per_trial']` epoch trên seed `{python} TUNING['protocol']['seed']` và được chấm điểm **chỉ trên validation speakers**. Tập test không tham gia bất kỳ bước chọn nào.
+**Grid search.** Learning rate và ArcFace margin được tìm kiếm trên lưới `{python} len(TUNING['search_space']['learning_rate'])`×`{python} len(TUNING['search_space']['arcface_margin'])`, mỗi trial huấn luyện `{python} TUNING['protocol']['epochs_per_trial']` epoch trên seed `{python} TUNING['protocol']['seed']` và được chấm điểm **chỉ trên validation speakers**. Tập test không tham gia bất kỳ bước chọn nào. Lưới có tín hiệu rõ chứ không phẳng: cấu hình tốt nhất đạt `{python} fmt(TUNING['selected']['validation_accuracy'], 4)` trong khi cấu hình tệ nhất chỉ đạt `{python} fmt(min(t['best_validation_accuracy'] for t in TUNING['trials']), 4)`.
 
 ```{python}
 display(table(["learning rate", "ArcFace margin", "validation accuracy", "best epoch"],
@@ -271,6 +289,7 @@ display(table(["learning rate", "ArcFace margin", "validation accuracy", "best e
 ```{python}
 #| label: fig-tuning
 #| fig-cap: "Validation accuracy trên lưới learning rate × ArcFace margin. Cấu hình thắng được dùng cho cả ba seed."
+#| out-width: "58%"
 fig("tuning-grid.png")
 ```
 
@@ -421,31 +440,30 @@ Phân tích lỗi giới hạn ở điều kiện khó nhất và có ý nghĩa 
 ```{python}
 bad = Counter(x["family"] for x in LOW_ERRORS)
 total = Counter(r["noise_family"] for r in LOW_RAW for x in r["query_predictions"])
-display(table(["họ nhiễu", "số lỗi", "số truy vấn", "tỉ lệ lỗi"], [[f, bad[f], total[f], fmt(bad[f] / total[f])] for f in FAMILIES]))
-```
-
-```{python}
 stat = defaultdict(lambda: [0, 0])
 for r in LOW_RAW:
     for q in r["query_predictions"]:
         stat[q["speaker_id"]][0] += int(not q["correct"]); stat[q["speaker_id"]][1] += 1
-hard = sorted(stat.items(), key=lambda x: (x[1][0] / x[1][1], x[1][0]), reverse=True)[:8]
-display(table(["speaker khó nhất", "số lỗi", "số truy vấn", "tỉ lệ lỗi"], [[SPEAKER_ALIAS[s], b, n, fmt(b / n)] for s, (b, n) in hard]))
-```
-
-```{python}
+hard = sorted(stat.items(), key=lambda x: (x[1][0] / x[1][1], x[1][0]), reverse=True)
 pairs = Counter((x["true_speaker"], x["predicted_speaker"]) for x in LOW_ERRORS)
-display(table(["cặp nhầm lẫn (đúng → dự đoán)", "số lần"],
- [[f"{SPEAKER_ALIAS[a]} → {SPEAKER_ALIAS[b]}", n] for (a, b), n in pairs.most_common(8)]))
+chosen = sorted(LOW_ERRORS, key=lambda x: (-float(x["score"]), x["sample_id"]))
+display(table(["họ nhiễu", "số lỗi", "số truy vấn", "tỉ lệ lỗi"], [[f, bad[f], total[f], fmt(bad[f] / total[f])] for f in FAMILIES]))
 ```
 
 ```{python}
-chosen = sorted(LOW_ERRORS, key=lambda x: (-float(x["score"]), x["sample_id"]))[:8]
-display(table(["mẫu", "họ nhiễu", "đúng", "dự đoán", "cosine score"],
- [[SAMPLE_ALIAS[x["sample_id"]], x["family"], SPEAKER_ALIAS[x["true_speaker"]], SPEAKER_ALIAS[x["predicted_speaker"]], fmt(float(x["score"]))] for x in chosen]))
+display(table(["speaker khó nhất", "số lỗi", "số truy vấn", "tỉ lệ lỗi"], [[SPEAKER_ALIAS[s], b, n, fmt(b / n)] for s, (b, n) in hard[:8]]))
 ```
 
-Ba nhận xét. **Thứ nhất**, tỉ lệ lỗi phân bố không đều giữa các họ nhiễu: nhiễu có cấu trúc phổ giống tiếng nói gây nhiều lỗi hơn nhiễu băng rộng, phù hợp với việc chúng che phủ đúng vùng tần số mang thông tin speaker. **Thứ hai**, lỗi tập trung ở một nhóm nhỏ speaker — vài speaker chiếm phần lớn số lỗi, cho thấy khoảng cách centroid của các speaker này vốn đã nhỏ và nhiễu chỉ cần đẩy nhẹ là vượt biên. **Thứ ba**, bảng cuối cho thấy các lỗi có cosine score cao: mô hình sai một cách *tự tin*. Cần lưu ý "confidence" ở đây là cosine tới centroid được dự đoán, không phải xác suất đã hiệu chuẩn, nên không dùng được làm ngưỡng từ chối nếu chưa hiệu chuẩn. Quy tắc chọn mẫu (lọc theo điều kiện, sắp giảm dần theo score rồi theo mã mẫu) là xác định nên bảng này tái lập được. Báo cáo không suy diễn nguyên nhân ngữ âm hay nhân khẩu học vì artifact không chứa nhãn đó.
+```{python}
+display(table(["cặp nhầm lẫn (đúng → dự đoán)", "số lần"], [[f"{SPEAKER_ALIAS[a]} → {SPEAKER_ALIAS[b]}", n] for (a, b), n in pairs.most_common(8)]))
+```
+
+```{python}
+display(table(["mẫu", "họ nhiễu", "đúng", "dự đoán", "cosine score"],
+ [[SAMPLE_ALIAS[x["sample_id"]], x["family"], SPEAKER_ALIAS[x["true_speaker"]], SPEAKER_ALIAS[x["predicted_speaker"]], fmt(float(x["score"]))] for x in chosen[:8]]))
+```
+
+Ba nhận xét. **Thứ nhất**, tỉ lệ lỗi phân bố không đều giữa các họ nhiễu: nhiễu có cấu trúc phổ giống tiếng nói gây nhiều lỗi hơn nhiễu băng rộng, phù hợp với việc chúng che phủ đúng vùng tần số mang thông tin speaker. **Thứ hai**, lỗi tập trung ở một nhóm nhỏ speaker: `{python} SPEAKER_ALIAS[hard[0][0]]` sai `{python} fmt(hard[0][1][0] / hard[0][1][1])` số truy vấn trong khi speaker dễ nhất chỉ sai `{python} fmt(hard[-1][1][0] / hard[-1][1][1])`, cho thấy khoảng cách centroid của các speaker này vốn đã nhỏ và nhiễu chỉ cần đẩy nhẹ là vượt biên. Cặp nhầm lẫn phổ biến nhất là `{python} f"{SPEAKER_ALIAS[pairs.most_common(1)[0][0][0]]} → {SPEAKER_ALIAS[pairs.most_common(1)[0][0][1]]}"` với `{python} pairs.most_common(1)[0][1]` lần. **Thứ ba**, các lỗi có cosine score cao — cao nhất là `{python} fmt(float(chosen[0]['score']))` — tức mô hình sai một cách *tự tin*. Cần lưu ý "confidence" ở đây là cosine tới centroid được dự đoán, không phải xác suất đã hiệu chuẩn, nên không dùng được làm ngưỡng từ chối nếu chưa hiệu chuẩn. Quy tắc chọn mẫu (lọc theo điều kiện, sắp giảm dần theo score rồi theo mã mẫu) là xác định nên bảng này tái lập được. Báo cáo không suy diễn nguyên nhân ngữ âm hay nhân khẩu học vì artifact không chứa nhãn đó.
 
 # Discussion
 
@@ -455,11 +473,11 @@ Ba nhận xét. **Thứ nhất**, tỉ lệ lỗi phân bố không đều giữ
 
 **RQ2.** Main effect của band-pass là `{python} signed(eff('bandpass_main')['mean_delta'])` (`{python} verdict('bandpass_main')`), của Wiener là `{python} signed(eff('wiener_main')['mean_delta'])` (`{python} verdict('wiener_main')`), interaction là `{python} signed(eff('bandpass_x_wiener')['mean_delta'])` (`{python} verdict('bandpass_x_wiener')`). Vì bốn cell dùng chung checkpoint và chung mixture, các effect này quy được về đúng khối DSP.
 
-**RQ3.** Bảng đặc trưng hoá cho thấy có cell làm tăng SNR waveform mà vẫn không làm tăng accuracy; positive control loại trừ khả năng lỗi cài đặt. Vậy SNR waveform không phải proxy đủ tin cậy cho chất lượng embedding.
+**RQ3.** Bảng đặc trưng hoá cho câu trả lời trực tiếp: tại `{python} f"{min(SNRS):g}"` dB, Wiener **tăng** SNR waveform `{python} fmt(gain('wiener', min(SNRS)), 2)` dB nhưng accuracy lại **giảm** `{python} fmt(abs(eff('wiener_minus_raw')['mean_delta']), 4)` point; positive control (`{python} fmt(POSITIVE['measurements'][0]['snr_gain_db'], 2)` dB trên nhiễu Gauss dừng) loại trừ khả năng lỗi cài đặt. Vậy SNR waveform không phải proxy đủ tin cậy cho chất lượng embedding.
 
 **RQ4.** Lỗi tập trung theo họ nhiễu và theo speaker, phần lớn là lỗi tự tin, và Pipeline B không tái cấu trúc được ma trận nhầm lẫn theo hướng có lợi.
 
-**Phán quyết giả thuyết.** H1 (`{python} verdict('bandpass_wiener_minus_raw')` theo CI) và H2 (SNR gain không dự báo recognition gain) đều **không được dữ liệu ủng hộ** theo quy tắc quyết định đặt ra từ đầu.
+**Phán quyết giả thuyết.** Cả hai giả thuyết đều **bị bác bỏ** theo quy tắc quyết định đặt ra từ đầu. H1 dự đoán $\Delta_{BW}>0$, nhưng khoảng tin cậy quan sát được là `{python} ci('bandpass_wiener_minus_raw')` — nằm hoàn toàn về phía âm, tức ngược dấu với dự đoán. H2 dự đoán SNR gain đi cùng recognition gain, nhưng Wiener vừa tăng SNR vừa làm giảm accuracy, nên tương quan dương không được ủng hộ.
 
 ## Vì sao kết quả lại như vậy
 
@@ -529,7 +547,7 @@ QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
 
 Dữ liệu: VCTK 0.80 giải nén vào `dataset/VCTK-Corpus-0.80/wav48`, MUSAN (OpenSLR 17) vào `dataset/musan`. Mỗi lần chạy `run.py all` cấp phát một run mới bất biến; run đã hoàn tất không thể bị ghi đè, và `--run-id N` chỉ dùng để tiếp tục một phase còn dang dở với đúng snapshot config đó. Báo cáo này đọc `{python} f"outputs/{CONFIG['study_id']}/runs/{MANIFEST['run_tag']}"` và **không** huấn luyện hay đánh giá lại bất cứ thứ gì; muốn dựng báo cáo cho một run khác, chỉ cần đổi `RUN_ID` ở chunk đầu tiên.
 
-# Phụ lục A — Literature Matrix {.appendix}
+# Phụ lục A — Literature Matrix {.unnumbered}
 
 ```{python}
 display(table(["Paper", "DSP", "AI model", "Dataset", "Key findings", "Research gap", "Limitations"], [
@@ -546,7 +564,7 @@ display(table(["Paper", "DSP", "AI model", "Dataset", "Key findings", "Research 
 ]))
 ```
 
-# Phụ lục B — AI Declaration {.appendix}
+# Phụ lục B — AI Declaration {.unnumbered}
 
 | Mục | Nội dung |
 |---|---|
