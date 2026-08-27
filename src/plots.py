@@ -6,17 +6,17 @@ import json
 from collections import defaultdict
 
 import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import signal as scipy_signal
+
+from src import dsp
+from src.config import ExperimentConfig
+from src.corpus import load_clips, load_manifest
+from src.noise import load_noise_pool, mix_at_snr, noise_for_sample
+from src.pipeline import build_chain
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-from scipy import signal as scipy_signal  # noqa: E402
-
-from src import dsp  # noqa: E402
-from src.config import ExperimentConfig  # noqa: E402
-from src.corpus import load_clips, load_manifest  # noqa: E402
-from src.noise import load_noise_pool, mix_at_snr, noise_for_sample  # noqa: E402
-from src.pipeline import build_chain  # noqa: E402
 
 FIGSIZE_WIDE = (11, 4.5)
 DEMO_SNR_DB = 5.0
@@ -160,16 +160,18 @@ def plot_filter_response(config: ExperimentConfig) -> None:
     plt.close(figure)
 
 
-def _series_by_condition(rows, metric, model="cnn"):
+def _series_by_condition(rows, metric, model="cnn", protocol="unseen"):
     grouped = defaultdict(lambda: defaultdict(list))
     for row in rows:
         if row["model"] != model or row["test_snr_db"] is None:
+            continue
+        if row.get("protocol", "unseen") != protocol:
             continue
         grouped[row["condition"]][row["test_snr_db"]].append(row[metric])
     return grouped
 
 
-def _clean_ceiling(rows, metric, model="cnn") -> float | None:
+def _clean_ceiling(rows, metric, model="cnn", protocol="unseen") -> float | None:
     """Mean score of the clean-trained arm, which has no test SNR axis."""
     values = [
         row[metric]
@@ -177,8 +179,45 @@ def _clean_ceiling(rows, metric, model="cnn") -> float | None:
         if row["condition"] == "clean"
         and row["model"] == model
         and row["test_snr_db"] is None
+        and row.get("protocol", "unseen") == protocol
     ]
     return float(np.mean(values)) if values else None
+
+
+def plot_protocol_comparison(config: ExperimentConfig, rows) -> None:
+    """Seen versus unseen speakers under an identical enrolment protocol.
+
+    The gap is the share of accuracy that comes from having fitted those
+    speakers during training rather than from a transferable representation.
+    """
+    protocols = {row.get("protocol", "unseen") for row in rows}
+    if "seen" not in protocols:
+        return
+
+    figure, axes = plt.subplots(1, 2, figsize=FIGSIZE_WIDE, sharey=True)
+    for axis, condition in zip(axes, ("A_raw_noisy", "B_full")):
+        for protocol, style in (("seen", "-o"), ("unseen", "--s")):
+            grouped = _series_by_condition(rows, "accuracy", protocol=protocol)
+            if condition not in grouped:
+                continue
+            snrs = sorted(grouped[condition])
+            axis.plot(
+                snrs,
+                [float(np.mean(grouped[condition][snr])) for snr in snrs],
+                style,
+                label=f"{protocol} speakers",
+                markersize=4,
+            )
+        axis.set_title(condition, fontsize=9)
+        axis.set_xlabel("test SNR (dB)")
+        axis.set_ylim(0, 1)
+        axis.grid(alpha=0.3)
+    axes[0].set_ylabel("identification accuracy")
+    axes[0].legend(fontsize=8)
+    figure.suptitle("Closed set (training speakers) versus open set (unseen speakers)")
+    figure.tight_layout()
+    figure.savefig(config.report_root / "protocol-comparison.png", dpi=150)
+    plt.close(figure)
 
 
 def plot_snr_curves(config: ExperimentConfig, rows) -> None:
@@ -349,5 +388,6 @@ def render_all(config: ExperimentConfig, rows) -> None:
     plot_spectrograms(config)
     plot_snr_curves(config, rows)
     plot_ablation(config, rows)
+    plot_protocol_comparison(config, rows)
     plot_confusion_matrices(config)
     plot_embedding_projection(config)

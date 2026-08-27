@@ -36,7 +36,7 @@ TUNING_GRID = (
     {"learning_rate": 3e-4, "batch_size": 64},
     {"learning_rate": 1e-3, "batch_size": 32},
 )
-TUNING_EPOCHS = 12
+TUNING_EPOCHS = 8
 
 
 def _tuning_path(config: ExperimentConfig):
@@ -177,48 +177,63 @@ def evaluate_study(
         # sweep the test SNR grid.
         snr_grid = (None,) if not condition.add_noise else config.test_snr_db
         for snr_db in snr_grid:
-            waveforms, records = prepared_split(
-                config, "test", condition_name, seed, snr_db=snr_db, workers=workers
-            )
-            embeddings = extract_embeddings(model, waveforms, device)
-            report = {
-                "condition": condition_name,
-                "seed": seed,
-                "test_snr_db": snr_db,
-                "stages": list(condition.stages),
-                **_evaluate_embeddings(embeddings, records, config, seed),
-            }
             tag = "clean" if snr_db is None else f"snr-{int(snr_db)}"
-            (run_root / f"evaluation-{tag}.json").write_text(
-                json.dumps(report, indent=2) + "\n", encoding="utf-8"
-            )
-            accuracy = report["nearest_centroid"]["accuracy"]
-            print(
-                f"  {condition_name:<18} seed {seed} {tag:<8} acc {accuracy:.4f}",
-                flush=True,
-            )
 
-            # Kept for the embedding-geometry figure; only the arms the report
-            # contrasts directly, to bound artifact size.
-            if condition_name in config.primary_conditions and snr_db in (
-                None,
-                config.test_snr_db[0],
-            ):
-                np.save(run_root / f"embeddings-{tag}.npy", embeddings)
-
-            # The DSP-only reference uses the same audio, so it is only computed
-            # for the two pipelines being contrasted.
-            if condition_name in ("A_raw_noisy", "B_full"):
-                reference = {
+            # `test` holds speakers never seen in training (open set); `seen_test`
+            # holds unseen utterances of the training speakers (closed set). The
+            # enrolment protocol is identical, so the gap between them isolates
+            # how much of the score comes from speaker-specific fitting.
+            for split, protocol in (("test", "unseen"), ("seen_test", "seen")):
+                if split == "seen_test" and not config.closed_set_clips:
+                    continue
+                waveforms, records = prepared_split(
+                    config, split, condition_name, seed, snr_db=snr_db, workers=workers
+                )
+                embeddings = extract_embeddings(model, waveforms, device)
+                report = {
                     "condition": condition_name,
                     "seed": seed,
                     "test_snr_db": snr_db,
+                    "protocol": protocol,
                     "stages": list(condition.stages),
-                    **_mfcc_reference(waveforms, records, config, seed),
+                    **_evaluate_embeddings(embeddings, records, config, seed),
                 }
-                (run_root / f"evaluation-{tag}-dsponly.json").write_text(
-                    json.dumps(reference, indent=2) + "\n", encoding="utf-8"
+                suffix = "" if protocol == "unseen" else "-seen"
+                (run_root / f"evaluation-{tag}{suffix}.json").write_text(
+                    json.dumps(report, indent=2) + "\n", encoding="utf-8"
                 )
+                accuracy = report["nearest_centroid"]["accuracy"]
+                print(
+                    f"  {condition_name:<18} seed {seed} {tag:<8} {protocol:<6} "
+                    f"acc {accuracy:.4f}",
+                    flush=True,
+                )
+
+                if protocol != "unseen":
+                    continue
+
+                # Kept for the embedding-geometry figure; only the arms the report
+                # contrasts directly, to bound artifact size.
+                if condition_name in config.primary_conditions and snr_db in (
+                    None,
+                    config.test_snr_db[0],
+                ):
+                    np.save(run_root / f"embeddings-{tag}.npy", embeddings)
+
+                # The DSP-only reference uses the same audio, so it is only computed
+                # for the two pipelines being contrasted.
+                if condition_name in ("A_raw_noisy", "B_full"):
+                    reference = {
+                        "condition": condition_name,
+                        "seed": seed,
+                        "test_snr_db": snr_db,
+                        "protocol": protocol,
+                        "stages": list(condition.stages),
+                        **_mfcc_reference(waveforms, records, config, seed),
+                    }
+                    (run_root / f"evaluation-{tag}-dsponly.json").write_text(
+                        json.dumps(reference, indent=2) + "\n", encoding="utf-8"
+                    )
         del model
         torch.cuda.empty_cache()
 
@@ -237,6 +252,7 @@ def collect_metrics(config: ExperimentConfig) -> list[dict[str, object]]:
                 "condition": payload["condition"],
                 "seed": payload["seed"],
                 "test_snr_db": payload["test_snr_db"],
+                "protocol": payload.get("protocol", "unseen"),
                 "model": "dsp_only" if report_path.stem.endswith("dsponly") else "cnn",
                 "accuracy": payload["nearest_centroid"]["accuracy"],
                 "precision_macro": payload["nearest_centroid"]["precision_macro"],
@@ -255,29 +271,31 @@ def collect_metrics(config: ExperimentConfig) -> list[dict[str, object]]:
 
 def _significance_table(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Paired tests of Pipeline B against Pipeline A, matched on seed and SNR."""
-    indexed = {
-        (row["condition"], row["seed"], row["test_snr_db"]): row
-        for row in rows
-        if row["model"] == "cnn"
-    }
     results = []
-    for metric in ("accuracy", "f1_macro", "agglomerative_ari"):
-        baseline, proposed = [], []
-        for (condition, seed, snr), row in indexed.items():
-            if condition != "A_raw_noisy":
-                continue
-            partner = indexed.get(("B_full", seed, snr))
-            if partner is not None:
-                baseline.append(row[metric])
-                proposed.append(partner[metric])
-        if baseline:
-            results.append(
-                {
-                    "metric": metric,
-                    "comparison": "B_full - A_raw_noisy",
-                    **paired_significance(baseline, proposed),
-                }
-            )
+    for protocol in sorted({row["protocol"] for row in rows}):
+        indexed = {
+            (row["condition"], row["seed"], row["test_snr_db"]): row
+            for row in rows
+            if row["model"] == "cnn" and row["protocol"] == protocol
+        }
+        for metric in ("accuracy", "f1_macro", "agglomerative_ari"):
+            baseline, proposed = [], []
+            for (condition, seed, snr), row in indexed.items():
+                if condition != "A_raw_noisy":
+                    continue
+                partner = indexed.get(("B_full", seed, snr))
+                if partner is not None:
+                    baseline.append(row[metric])
+                    proposed.append(partner[metric])
+            if baseline:
+                results.append(
+                    {
+                        "metric": metric,
+                        "protocol": protocol,
+                        "comparison": "B_full - A_raw_noisy",
+                        **paired_significance(baseline, proposed),
+                    }
+                )
     return results
 
 

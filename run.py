@@ -29,8 +29,10 @@ def stage_prepare(config: ExperimentConfig, args: argparse.Namespace) -> None:
         sample_rate=config.sample_rate,
         segment_seconds=config.segment_seconds,
         clips_per_speaker=config.clips_per_speaker,
+        eval_clips_per_speaker=config.eval_clips_per_speaker,
         train_speakers=config.train_speakers,
         validation_speakers=config.validation_speakers,
+        closed_set_clips=config.closed_set_clips,
     )
     pool_path = build_noise_pool(
         Path(config.musan_root),

@@ -21,7 +21,6 @@ from src.noise import mix_at_snr, noise_for_sample, snr_for_sample
 def build_chain(condition: Condition, config: ExperimentConfig) -> dsp.DspChain:
     """Materialise the DSP stages named by ``condition``."""
     builders = {
-        "preemph": lambda x: dsp.pre_emphasis(x, config.preemph_coefficient),
         "highpass": lambda x: dsp.highpass(x, config.sample_rate, config.highpass_hz),
         "lowpass": lambda x: dsp.lowpass(x, config.sample_rate, config.lowpass_hz),
         "telephone": lambda x: dsp.bandpass(

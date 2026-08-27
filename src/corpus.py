@@ -17,8 +17,6 @@ import soundfile as sf
 import torch
 import torchaudio
 
-SPLITS = ("train", "validation", "test")
-
 #: Frames quieter than this fraction of the clip peak RMS are treated as silence.
 SILENCE_RMS_RATIO = 0.05
 
@@ -79,21 +77,37 @@ def trim_silence(waveform: np.ndarray, frame_length: int = 512) -> np.ndarray:
 
 
 def _records_for_speaker(
-    speaker_dir: Path, split: str, seed: int, clips_per_speaker: int
+    speaker_dir: Path,
+    split: str,
+    seed: int,
+    clips_per_speaker: int,
+    start_index: int = 0,
 ) -> list[ClipRecord]:
     source_files = sorted(speaker_dir.glob("*.wav"))
     if not source_files:
         return []
+    if clips_per_speaker + start_index > len(source_files):
+        raise ValueError(
+            f"{speaker_dir.name} has {len(source_files)} utterances, cannot draw "
+            f"{clips_per_speaker} disjoint clips from offset {start_index}"
+        )
 
     # Deterministic rotation over distinct utterances, so a speaker is not
-    # represented by repeated crops of the same sentence.
+    # represented by repeated crops of the same sentence. ``start_index`` shifts
+    # the window, which is how the held-out seen-speaker split stays
+    # utterance-disjoint from the training clips.
     offset = _deterministic_index(
         f"{seed}:{speaker_dir.name}:offset", len(source_files)
     )
     records: list[ClipRecord] = []
     for clip_index in range(clips_per_speaker):
-        candidate = source_files[(offset + clip_index) % len(source_files)]
-        sample_id = f"{speaker_dir.name}/{candidate.stem}/clip-{clip_index:03d}"
+        candidate = source_files[
+            (offset + start_index + clip_index) % len(source_files)
+        ]
+        # sample_id seeds the noise and SNR draw, so the base window keeps its
+        # original form; only the shifted held-out window is marked.
+        prefix = "clip" if start_index == 0 else "heldout-clip"
+        sample_id = f"{speaker_dir.name}/{candidate.stem}/{prefix}-{clip_index:03d}"
         records.append(
             ClipRecord(
                 sample_id=sample_id,
@@ -142,8 +156,10 @@ def build_corpus_cache(
     sample_rate: int,
     segment_seconds: float,
     clips_per_speaker: int,
+    eval_clips_per_speaker: int,
     train_speakers: int,
     validation_speakers: int,
+    closed_set_clips: int = 0,
 ) -> dict[str, Path]:
     """Write per-split manifests and cached 16 kHz clips; returns manifest paths."""
     cache_root = Path(cache_root)
@@ -152,13 +168,24 @@ def build_corpus_cache(
     speaker_splits = split_speakers(
         vctk_root, seed, train_speakers, validation_speakers
     )
+    # Only training benefits from a larger clip budget; evaluation splits stay
+    # small so the metrics stay cheap and comparable across runs.
+    plan = [
+        ("train", speaker_splits["train"], clips_per_speaker, 0),
+        ("validation", speaker_splits["validation"], eval_clips_per_speaker, 0),
+        ("test", speaker_splits["test"], eval_clips_per_speaker, 0),
+    ]
+    if closed_set_clips:
+        plan.append(
+            ("seen_test", speaker_splits["train"], closed_set_clips, clips_per_speaker)
+        )
 
     manifest_paths: dict[str, Path] = {}
-    for split, speaker_dirs in speaker_splits.items():
+    for split, speaker_dirs, n_clips, start_index in plan:
         records: list[ClipRecord] = []
         for speaker_dir in speaker_dirs:
             records.extend(
-                _records_for_speaker(speaker_dir, split, seed, clips_per_speaker)
+                _records_for_speaker(speaker_dir, split, seed, n_clips, start_index)
             )
 
         clips = np.zeros((len(records), segment_samples), dtype=np.float32)

@@ -88,14 +88,6 @@ def notch(
     return np.asarray(signal.filtfilt(b, a, waveform), dtype=np.float32)
 
 
-def pre_emphasis(waveform: Waveform, coefficient: float = 0.97) -> Waveform:
-    """First-order FIR high-frequency emphasis ``y[n] = x[n] - a*x[n-1]``."""
-    out = np.empty_like(waveform, dtype=np.float32)
-    out[0] = waveform[0]
-    out[1:] = waveform[1:] - coefficient * waveform[:-1]
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Adaptive notch: find narrowband tonal interference from the Welch PSD
 # --------------------------------------------------------------------------- #
@@ -267,6 +259,3 @@ class DspChain:
         for stage in self.stages:
             out = np.asarray(stage(out), dtype=np.float32)
         return out
-
-    def __len__(self) -> int:
-        return len(self.stages)

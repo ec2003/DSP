@@ -8,7 +8,8 @@
 
   "sample_rate": 16000,
   "segment_seconds": 2.0,
-  "clips_per_speaker": 50,
+  "clips_per_speaker": 140,
+  "eval_clips_per_speaker": 50,
   "train_speakers": 60,
   "validation_speakers": 20,
 
@@ -41,7 +42,6 @@
   "wiener_gain_floor_db": -18.0,
   "specsub_over_subtraction": 1.5,
   "specsub_spectral_floor": 0.05,
-  "preemph_coefficient": 0.97,
 
   "embedding_dim": 192,
   "cnn_channels": [32, 64, 128, 256],
@@ -49,10 +49,11 @@
   "arcface_scale": 30.0,
   "learning_rate": 0.001,
   "batch_size": 64,
-  "epochs": 30,
+  "epochs": 18,
   "weight_decay": 2e-05,
   "optimizer": "adamw",
 
   "enrollment_clips": 10,
+  "closed_set_clips": 30,
   "cluster_min_size": 5
 }

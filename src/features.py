@@ -197,10 +197,6 @@ def handcrafted_features(waveform: np.ndarray, sample_rate: int = 16000) -> np.n
 # --------------------------------------------------------------------------- #
 # Signal-quality diagnostics
 # --------------------------------------------------------------------------- #
-def rms_db(waveform: np.ndarray) -> float:
-    return float(20.0 * np.log10(np.sqrt(np.mean(waveform**2)) + EPS))
-
-
 def residual_snr_db(clean: np.ndarray, processed: np.ndarray) -> float:
     """SNR of ``processed`` treating ``clean`` as the reference signal."""
     length = min(clean.size, processed.size)

@@ -56,11 +56,16 @@ DSP_EFFECT = json.loads((REPORTS / "dsp-effect.json").read_text(encoding="utf-8"
 TUNING = json.loads((STUDY_ROOT / "tuning.json").read_text(encoding="utf-8"))
 
 
-def mean_by(condition: str, metric: str, model: str = "cnn") -> float | None:
+def mean_by(
+    condition: str, metric: str, model: str = "cnn", protocol: str = "unseen"
+) -> float | None:
     values = [
         float(row[metric])
         for row in METRICS
-        if row["condition"] == condition and row["model"] == model and row[metric]
+        if row["condition"] == condition
+        and row["model"] == model
+        and row.get("protocol", "unseen") == protocol
+        and row[metric]
     ]
     return sum(values) / len(values) if values else None
 
@@ -176,7 +181,8 @@ display(
             ["Noise corpus", "MUSAN `noise` subset"],
             ["Resampled to", f"{CONFIG['sample_rate']} Hz mono"],
             ["Clip length", f"{CONFIG['segment_seconds']} s after silence trimming"],
-            ["Clips per speaker", CONFIG["clips_per_speaker"]],
+            ["Training clips per speaker", CONFIG["clips_per_speaker"]],
+            ["Evaluation clips per speaker", CONFIG["eval_clips_per_speaker"]],
             ["Train speakers", CONFIG["train_speakers"]],
             ["Validation speakers", CONFIG["validation_speakers"]],
             ["Test speakers", f"{109 - CONFIG['train_speakers'] - CONFIG['validation_speakers']} (disjoint)"],
@@ -384,12 +390,25 @@ display(
 
 ## Evaluation protocol
 
-For each held-out test speaker the first `enrollment_clips` clips form the
-enrolment set and the remainder are queries. Identification is by cosine nearest
-centroid and by a linear SVM on the same embeddings. Clustering uses
-agglomerative clustering with the true speaker count (giving ARI/NMI that are
-directly comparable across arms) and HDBSCAN with an unknown cluster count
-(giving an outlier rate that reflects embedding compactness).
+Identification uses an enrolment protocol: for each evaluated speaker the first
+`enrollment_clips` clips form the enrolment set and the remainder are queries,
+scored by cosine nearest centroid and by a linear SVM on the same embeddings.
+Clustering uses agglomerative clustering with the true speaker count (giving
+ARI/NMI that are directly comparable across arms) and HDBSCAN with an unknown
+cluster count (giving an outlier rate that reflects embedding compactness).
+
+The same protocol is applied to two speaker populations:
+
+| Protocol | Population | What it measures |
+|---|---|---|
+| **Closed set** (`seen`) | Held-out *utterances* of the 60 training speakers | Identification among speakers the encoder was fitted to. |
+| **Open set** (`unseen`) | 29 speakers absent from training entirely | Whether the encoder learned a transferable notion of speaker identity. |
+
+Because the enrolment mechanics are identical, the gap between the two is a
+direct measurement of how much of the score comes from speaker-specific fitting
+rather than from a generalisable representation. Unless stated otherwise, all
+results below use the open-set protocol, which is the harder and more
+informative of the two.
 
 # Experimental results
 
@@ -416,7 +435,7 @@ for condition in conditions:
         ]
     )
 display(table(rows, ["Arm", "Accuracy", "Precision", "Recall", "F1", "ARI", "NMI"]))
-display(Markdown("\nMeans over seeds and test SNRs. Higher is better throughout."))
+display(Markdown("\nOpen-set protocol; means over seeds and test SNRs. Higher is better throughout."))
 ```
 
 ![Embedding quality versus test SNR.](outputs/dsp501-speaker-embedding-v2/reports/snr-curves.png){#fig-snr}
@@ -424,6 +443,39 @@ display(Markdown("\nMeans over seeds and test SNRs. Higher is better throughout.
 ![Stage-by-stage ablation.](outputs/dsp501-speaker-embedding-v2/reports/ablation-f1.png){#fig-ablation}
 
 ![Row-normalised confusion matrices at the hardest test SNR.](outputs/dsp501-speaker-embedding-v2/reports/confusion-matrices.png){#fig-confusion}
+
+## Closed set versus open set
+
+The same encoders, the same audio processing and the same enrolment mechanics,
+applied to speakers the encoder was trained on versus speakers it has never
+heard.
+
+```{python}
+# | label: protocol-table
+rows = []
+for condition in ("clean", "A_raw_noisy", "B_full"):
+    seen = mean_by(condition, "accuracy", protocol="seen")
+    unseen = mean_by(condition, "accuracy", protocol="unseen")
+    if seen is None or unseen is None:
+        continue
+    rows.append(
+        [condition, f"{seen:.4f}", f"{unseen:.4f}", f"{seen - unseen:+.4f}"]
+    )
+display(
+    table(
+        rows,
+        ["Arm", "Closed set (seen speakers)", "Open set (unseen speakers)", "Gap"],
+    )
+)
+```
+
+![Closed set against open set across the SNR grid.](outputs/dsp501-speaker-embedding-v2/reports/protocol-comparison.png){#fig-protocol}
+
+<!-- TODO(author): interpret the gap. A large gap means the encoder is fitting
+     the training speakers rather than learning a transferable representation,
+     which is the expected consequence of training on only 60 speakers. State
+     whether the DSP ranking is the same under both protocols; if it is, the
+     conclusion about the front-end does not depend on the protocol choice. -->
 
 ## Baseline comparison: learned embedding versus classical DSP-only features
 
@@ -449,6 +501,7 @@ display(
         [
             [
                 s["metric"],
+                s.get("protocol", "unseen"),
                 s["comparison"],
                 s["n_pairs"],
                 f"{s['mean_difference']:+.4f}",
@@ -458,7 +511,16 @@ display(
             ]
             for s in SIGNIFICANCE
         ],
-        ["Metric", "Comparison", "n", "Mean diff.", "95% CI", "t-test p", "Wilcoxon p"],
+        [
+            "Metric",
+            "Protocol",
+            "Comparison",
+            "n",
+            "Mean diff.",
+            "95% CI",
+            "t-test p",
+            "Wilcoxon p",
+        ],
     )
 )
 ```

@@ -7,16 +7,13 @@ be reproduced from the config file plus the seed alone.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: DSP stage names that :func:`src.pipeline.build_chain` knows how to build.
 KNOWN_STAGES = frozenset(
-    {"preemph", "highpass", "lowpass", "telephone", "notch", "wiener", "specsub"}
+    {"highpass", "lowpass", "telephone", "notch", "wiener", "specsub"}
 )
-
-#: Splits produced by ``run.py prepare``.
-SPLITS = ("train", "validation", "test")
 
 
 @dataclass(frozen=True)
@@ -47,6 +44,7 @@ class ExperimentConfig:
     sample_rate: int
     segment_seconds: float
     clips_per_speaker: int
+    eval_clips_per_speaker: int
     train_speakers: int
     validation_speakers: int
 
@@ -70,7 +68,6 @@ class ExperimentConfig:
     wiener_gain_floor_db: float
     specsub_over_subtraction: float
     specsub_spectral_floor: float
-    preemph_coefficient: float
 
     embedding_dim: int
     cnn_channels: tuple[int, ...]
@@ -83,6 +80,7 @@ class ExperimentConfig:
     optimizer: str
 
     enrollment_clips: int
+    closed_set_clips: int
     cluster_min_size: int
 
     def __post_init__(self) -> None:
@@ -94,10 +92,15 @@ class ExperimentConfig:
                 f"require 0 < highpass ({self.highpass_hz}) < lowpass "
                 f"({self.lowpass_hz}) < Nyquist ({nyquist})"
             )
-        if self.enrollment_clips >= self.clips_per_speaker:
+        if self.enrollment_clips >= self.eval_clips_per_speaker:
             raise ValueError(
                 f"enrollment_clips ({self.enrollment_clips}) must be smaller than "
-                f"clips_per_speaker ({self.clips_per_speaker})"
+                f"eval_clips_per_speaker ({self.eval_clips_per_speaker})"
+            )
+        if self.closed_set_clips and self.enrollment_clips >= self.closed_set_clips:
+            raise ValueError(
+                f"enrollment_clips ({self.enrollment_clips}) must be smaller than "
+                f"closed_set_clips ({self.closed_set_clips})"
             )
         known = {condition.name for condition in self.conditions}
         missing = set(self.primary_conditions) - known
@@ -144,17 +147,3 @@ def load_config(path: Path) -> ExperimentConfig:
         for name, spec in payload["conditions"].items()
     )
     return ExperimentConfig(**payload)
-
-
-def save_config(config: ExperimentConfig, path: Path) -> None:
-    payload = asdict(config)
-    payload["conditions"] = {
-        condition.name: {
-            "add_noise": condition.add_noise,
-            "stages": list(condition.stages),
-        }
-        for condition in config.conditions
-    }
-    Path(path).write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
