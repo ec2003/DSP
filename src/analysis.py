@@ -1,10 +1,14 @@
-"""Empirical filter design.
+"""Empirical filter design and signal-level characterisation of the front-end.
 
 Cutoff frequencies are not asserted from convention: they are derived from the
 measured long-term spectra of the VCTK speech and the MUSAN noise actually used
 in the study. The rule sacrifices at most ``SPEECH_ENERGY_MARGIN`` of speech
 energy at each band edge, and only cuts where the discarded region is genuinely
 noise-dominated.
+
+The second analysis measures what each arm does to real clips: how much noise it
+removes, and how much it distorts the speech while doing so. Those two numbers
+explain the downstream recognition results.
 """
 
 from __future__ import annotations
@@ -14,14 +18,18 @@ import json
 import numpy as np
 
 from src.config import ExperimentConfig
-from src.corpus import load_clips
-from src.features import OCTAVE_BAND_EDGES, band_power, welch_psd
-from src.noise import load_noise_pool
+from src.corpus import ClipRecord, load_clips, load_manifest
+from src.features import OCTAVE_BAND_EDGES, band_power, residual_snr_db, welch_psd
+from src.noise import load_noise_pool, mix_at_snr, noise_for_sample
+from src.pipeline import build_chain
 
 #: Fraction of total speech energy we accept discarding at each band edge.
 #: 0.01 removes 13% of the noise energy for 2.4% of the speech energy on this
 #: corpus; larger margins cut into the formant region.
 SPEECH_ENERGY_MARGIN = 0.01
+
+#: Clips sampled when characterising the front-end at the signal level.
+DSP_EFFECT_CLIPS = 200
 
 
 def average_psd(
@@ -115,6 +123,64 @@ def analyse_bands(config: ExperimentConfig) -> dict[str, object]:
 
     config.report_root.mkdir(parents=True, exist_ok=True)
     (config.report_root / "band-analysis.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return report
+
+
+def analyse_dsp_effect(config: ExperimentConfig) -> dict[str, object]:
+    """Measure noise suppression against speech distortion for every arm.
+
+    ``output_snr_db`` is measured against the clean reference, so it captures
+    residual noise *and* processing artefacts together. ``clean_path_snr_db``
+    runs the same chain on clean input, isolating the distortion the front-end
+    injects by itself; a transparent chain would score arbitrarily high.
+    """
+    records: list[ClipRecord] = load_manifest(config.cache_root, "test")
+    clips = load_clips(config.cache_root, "test")
+    pool = load_noise_pool(config.cache_root)
+    seed = config.seeds[0]
+    n_clips = min(DSP_EFFECT_CLIPS, len(records))
+
+    rows = []
+    for condition in config.conditions:
+        if not condition.add_noise:
+            continue
+        chain = build_chain(condition, config)
+        clean_path = [
+            residual_snr_db(clips[i], chain(clips[i])) for i in range(n_clips)
+        ]
+
+        for input_snr in config.test_snr_db:
+            output_snr = []
+            for index in range(n_clips):
+                noisy = mix_at_snr(
+                    clips[index],
+                    noise_for_sample(records[index].sample_id, seed, pool),
+                    input_snr,
+                )
+                output_snr.append(residual_snr_db(clips[index], chain(noisy)))
+            rows.append(
+                {
+                    "condition": condition.name,
+                    "stages": list(condition.stages),
+                    "input_snr_db": float(input_snr),
+                    "output_snr_db": float(np.mean(output_snr)),
+                    "clean_path_snr_db": float(np.mean(clean_path)),
+                }
+            )
+
+    baseline = {
+        row["input_snr_db"]: row["output_snr_db"]
+        for row in rows
+        if row["condition"] == "A_raw_noisy"
+    }
+    for row in rows:
+        row["snr_gain_db"] = row["output_snr_db"] - baseline[row["input_snr_db"]]
+
+    report = {"n_clips": n_clips, "seed": seed, "measurements": rows}
+    config.report_root.mkdir(parents=True, exist_ok=True)
+    (config.report_root / "dsp-effect.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
     return report

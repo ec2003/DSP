@@ -37,6 +37,7 @@ REQUIRED = {
     "metric summary": REPORTS / "metric-summary.csv",
     "significance tests": REPORTS / "significance.json",
     "band analysis": REPORTS / "band-analysis.json",
+    "front-end characterisation": REPORTS / "dsp-effect.json",
     "tuning result": STUDY_ROOT / "tuning.json",
 }
 missing = [f"{name} ({path})" for name, path in REQUIRED.items() if not path.is_file()]
@@ -51,6 +52,7 @@ with (REPORTS / "metric-summary.csv").open(newline="", encoding="utf-8") as stre
     METRICS = list(csv.DictReader(stream))
 SIGNIFICANCE = json.loads((REPORTS / "significance.json").read_text(encoding="utf-8"))
 BANDS = json.loads((REPORTS / "band-analysis.json").read_text(encoding="utf-8"))
+DSP_EFFECT = json.loads((REPORTS / "dsp-effect.json").read_text(encoding="utf-8"))
 TUNING = json.loads((STUDY_ROOT / "tuning.json").read_text(encoding="utf-8"))
 
 
@@ -269,6 +271,45 @@ in general from the benefit of this estimator in particular.
 
 ![STFT magnitude before and after the front-end.](outputs/dsp501-speaker-embedding-v2/reports/spectrograms.png){#fig-spectrograms}
 
+### Signal-level characterisation of the front-end
+
+Before asking what the front-end does to recognition, we measure what it does to
+the signal. Two quantities are reported per arm: the SNR of the processed
+mixture measured against the clean reference (so it charges the arm for residual
+noise *and* for processing artefacts), and the SNR obtained by running the same
+chain on **clean** input, which isolates the distortion the chain injects by
+itself. A perfectly transparent chain would score arbitrarily high on the second
+measure.
+
+```{python}
+# | label: dsp-effect-table
+hardest = min(float(s) for s in CONFIG["test_snr_db"])
+display(
+    table(
+        [
+            [
+                row["condition"],
+                " + ".join(row["stages"]) or "—",
+                f"{row['output_snr_db']:.2f}",
+                f"{row['snr_gain_db']:+.2f}",
+                f"{row['clean_path_snr_db']:.2f}",
+            ]
+            for row in DSP_EFFECT["measurements"]
+            if row["input_snr_db"] == hardest
+        ],
+        [
+            "Arm",
+            "Stages",
+            f"Output SNR at {hardest:.0f} dB in (dB)",
+            "Gain vs A (dB)",
+            "Clean-path SNR (dB)",
+        ],
+    )
+)
+```
+
+![Noise suppression achieved, against the distortion injected into clean speech.](outputs/dsp501-speaker-embedding-v2/reports/dsp-effect.png){#fig-dsp-effect}
+
 ## Feature extraction
 
 The learned model consumes an 80-band log-mel spectrogram
@@ -469,20 +510,36 @@ for condition in ("A_raw_noisy", "B_full"):
 
 ## Why the results occurred
 
-<!-- TODO(author): link each ablation step back to @fig-bands and to DSP theory.
-     Band limiting should help exactly to the extent that the removed bands were
-     noise-dominated; the notch should help only if MUSAN tonal components fall
-     inside the retained band; Wiener gain should help most where the a-priori
-     SNR estimate is reliable, i.e. at moderate rather than very low SNR. -->
+The key evidence is @fig-dsp-effect read together with @fig-ablation. The
+front-end does suppress noise as designed, yet that is not what determines the
+recognition outcome; the distortion it injects into the speech is.
+
+<!-- TODO(author): develop this into prose. Anchor every claim in a number:
+     (a) compare the SNR gain column against the clean-path distortion column
+         for the same arm;
+     (b) note that the gain shrinks and then reverses as input SNR rises, which
+         follows from the a-priori SNR estimate becoming unnecessary once the
+         mixture is already clean;
+     (c) relate the ordering of the arms in @fig-ablation to their clean-path
+         distortion, and say explicitly whether the ordering matches;
+     (d) explain why an encoder trained on the noisy data can exploit spectral
+         detail that a fixed filter necessarily discards, and why band limiting
+         therefore removes speaker-discriminative information that carries
+         little energy (see the 4-8 kHz rows of the band table). -->
 
 ## Strengths
 
-<!-- TODO(author): compare against the baselines and against the literature. -->
+<!-- TODO(author): compare against the baselines and against the literature.
+     Note in particular that the cut-offs were derived from measured spectra
+     rather than assumed, and that the signal-level characterisation makes the
+     mechanism auditable rather than speculative. -->
 
 ## Weaknesses and limitations
 
 <!-- TODO(author): zero-phase filtering is non-causal; a single corpus; additive
-     noise only, no reverberation or channel effects; a single architecture. -->
+     noise only, no reverberation or channel effects; a single architecture;
+     the noise PSD is estimated from the quietest frames of a 2 s clip, which
+     over-estimates the noise floor when speech is continuous. -->
 
 # Threats to validity
 

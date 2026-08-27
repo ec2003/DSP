@@ -14,7 +14,7 @@ from pathlib import Path
 
 from src.config import ExperimentConfig, load_config
 
-STAGES = ("prepare", "analyse-bands", "tune", "train", "evaluate", "analyze")
+STAGES = ("prepare", "analyse-dsp", "tune", "train", "evaluate", "analyze")
 
 
 def stage_prepare(config: ExperimentConfig, args: argparse.Namespace) -> None:
@@ -44,11 +44,21 @@ def stage_prepare(config: ExperimentConfig, args: argparse.Namespace) -> None:
     print(f"  noise pool: {pool_path}")
 
 
-def stage_analyse_bands(config: ExperimentConfig, args: argparse.Namespace) -> None:
-    from src.analysis import analyse_bands
+def stage_analyse_dsp(config: ExperimentConfig, args: argparse.Namespace) -> None:
+    from src.analysis import analyse_bands, analyse_dsp_effect
 
-    report = analyse_bands(config)
-    print(json.dumps(report["recommended_cutoffs"], indent=2))
+    bands = analyse_bands(config)
+    print(json.dumps(bands["recommended_cutoffs"], indent=2))
+
+    effect = analyse_dsp_effect(config)
+    hardest = min(config.test_snr_db)
+    print(f"  front-end characterisation at {hardest:.0f} dB input:")
+    for row in effect["measurements"]:
+        if row["input_snr_db"] == hardest:
+            print(
+                f"    {row['condition']:<18} SNR gain {row['snr_gain_db']:+.2f} dB, "
+                f"clean-path distortion {row['clean_path_snr_db']:.2f} dB"
+            )
 
 
 def stage_tune(config: ExperimentConfig, args: argparse.Namespace) -> None:
@@ -81,7 +91,7 @@ def stage_analyze(config: ExperimentConfig, args: argparse.Namespace) -> None:
 
 DISPATCH = {
     "prepare": stage_prepare,
-    "analyse-bands": stage_analyse_bands,
+    "analyse-dsp": stage_analyse_dsp,
     "tune": stage_tune,
     "train": stage_train,
     "evaluate": stage_evaluate,

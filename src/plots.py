@@ -299,10 +299,52 @@ def plot_embedding_projection(config: ExperimentConfig) -> None:
     plt.close(figure)
 
 
+def plot_dsp_effect(config: ExperimentConfig) -> None:
+    """Noise suppression against speech distortion, the mechanism behind the results."""
+    report_path = config.report_root / "dsp-effect.json"
+    if not report_path.is_file():
+        return
+    measurements = json.loads(report_path.read_text(encoding="utf-8"))["measurements"]
+
+    by_condition = defaultdict(dict)
+    distortion = {}
+    for row in measurements:
+        by_condition[row["condition"]][row["input_snr_db"]] = row["snr_gain_db"]
+        distortion[row["condition"]] = row["clean_path_snr_db"]
+
+    figure, axes = plt.subplots(1, 2, figsize=FIGSIZE_WIDE)
+    for condition, gains in sorted(by_condition.items()):
+        snrs = sorted(gains)
+        axes[0].plot(
+            snrs, [gains[s] for s in snrs], marker="o", markersize=4, label=condition
+        )
+    axes[0].axhline(0, color="k", linewidth=0.8)
+    axes[0].set_xlabel("input SNR (dB)")
+    axes[0].set_ylabel("SNR gain over Pipeline A (dB)")
+    axes[0].set_title("Noise suppression achieved")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+
+    names = sorted(distortion, key=lambda n: distortion[n])
+    axes[1].barh(np.arange(len(names)), [distortion[n] for n in names], color="tab:red")
+    axes[1].set_yticks(np.arange(len(names)))
+    axes[1].set_yticklabels(names, fontsize=7)
+    axes[1].set_xlabel("SNR of clean input after the chain (dB)")
+    axes[1].set_title(
+        "Distortion injected into clean speech\n(higher is more transparent)"
+    )
+    axes[1].grid(axis="x", alpha=0.3)
+
+    figure.tight_layout()
+    figure.savefig(config.report_root / "dsp-effect.png", dpi=150)
+    plt.close(figure)
+
+
 def render_all(config: ExperimentConfig, rows) -> None:
     config.report_root.mkdir(parents=True, exist_ok=True)
     plot_band_analysis(config)
     plot_filter_response(config)
+    plot_dsp_effect(config)
     plot_waveforms(config)
     plot_spectrograms(config)
     plot_snr_curves(config, rows)

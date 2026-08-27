@@ -13,9 +13,10 @@ The study compares the two systems the assignment requires:
   adaptive notch, and an STFT-domain Wiener filter.
 
 Cut-off frequencies are **derived from measured data**, not assumed. `run.py
-analyse-bands` measures the long-term average spectra of the training speech and
-of the MUSAN noise pool and selects the band that discards at most 1% of speech
-energy at each edge.
+analyse-dsp` measures the long-term average spectra of the training speech and
+of the MUSAN noise pool, selects the band that discards at most 1% of speech
+energy at each edge, and then characterises how much noise each arm removes
+versus how much distortion it injects into the speech.
 
 ## Setup
 
@@ -46,7 +47,7 @@ Individual stages, in dependency order:
 | Stage | What it does |
 |---|---|
 | `prepare` | Speaker-disjoint splits, deterministic silence-trimmed 16 kHz clip cache, MUSAN noise pool. |
-| `analyse-bands` | Measures speech/noise band power and reports the derived cut-offs. |
+| `analyse-dsp` | Measures speech/noise band power, derives the cut-offs, and characterises what each arm does to real clips. |
 | `tune` | Grid search on Pipeline A with the first seed; the winner is locked for every arm. |
 | `train` | Trains the CNN encoder for each arm and seed. |
 | `evaluate` | Identification and clustering metrics on unseen test speakers across the SNR grid. |
