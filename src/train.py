@@ -26,7 +26,7 @@ from src.eval import (
     speaker_labels,
 )
 from src.models import ArcFaceHead, SpeakerCNN
-from src.noise import load_noise_pool
+from src.noise import load_noise_pool_for_split
 from src.pipeline import process_split
 
 
@@ -68,7 +68,12 @@ def prepared_split(
     records = load_manifest(config.cache_root, split)
     clips = load_clips(config.cache_root, split)
     condition = config.condition(condition_name)
-    noise_pool = load_noise_pool(config.cache_root) if condition.add_noise else None
+    # Each split draws from its own disjoint MUSAN partition.
+    noise_pool = (
+        load_noise_pool_for_split(config.cache_root, split)
+        if condition.add_noise
+        else None
+    )
     processed = process_split(
         clips,
         records,

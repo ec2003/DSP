@@ -13,7 +13,7 @@ from scipy import signal as scipy_signal
 from src import dsp
 from src.config import ExperimentConfig
 from src.corpus import load_clips, load_manifest
-from src.noise import load_noise_pool, mix_at_snr, noise_for_sample
+from src.noise import load_noise_pool_for_split, mix_at_snr, noise_for_sample
 from src.pipeline import build_chain
 
 matplotlib.use("Agg")
@@ -26,7 +26,7 @@ def _demo_signals(config: ExperimentConfig) -> dict[str, np.ndarray]:
     """One deterministic held-out clip at each stage of Pipeline B."""
     records = load_manifest(config.cache_root, "test")
     clips = load_clips(config.cache_root, "test")
-    pool = load_noise_pool(config.cache_root)
+    pool = load_noise_pool_for_split(config.cache_root, "test")
     seed = config.seeds[0]
 
     clean = clips[0]
@@ -379,6 +379,62 @@ def plot_dsp_effect(config: ExperimentConfig) -> None:
     plt.close(figure)
 
 
+def plot_generalisation_matrix(config: ExperimentConfig) -> None:
+    """Front-end benefit as a function of the train/inference mismatch.
+
+    One panel per encoder. The shaded band marks the SNR range the encoders were
+    trained on; outside it the inference condition is out of distribution, which
+    is where a front-end is supposed to earn its cost.
+    """
+    report_path = config.report_root / "cross-eval.json"
+    if not report_path.is_file():
+        return
+    rows = json.loads(report_path.read_text(encoding="utf-8"))
+    if not rows:
+        return
+
+    encoders = [
+        e for e in config.cross_eval_encoders if any(r["encoder"] == e for r in rows)
+    ]
+    figure, axes = plt.subplots(
+        1, len(encoders), figsize=(4.2 * len(encoders), 4.2), sharey=True
+    )
+    train_low, train_high = min(config.train_snr_db), max(config.train_snr_db)
+
+    for axis, encoder in zip(np.atleast_1d(axes), encoders):
+        for frontend in config.cross_eval_frontends:
+            grouped = defaultdict(list)
+            for row in rows:
+                if row["encoder"] == encoder and row["frontend"] == frontend:
+                    grouped[row["test_snr_db"]].append(row["accuracy"])
+            if not grouped:
+                continue
+            snrs = sorted(grouped)
+            label = "no DSP" if frontend == "A_raw_noisy" else "full DSP"
+            axis.plot(
+                snrs,
+                [float(np.mean(grouped[s])) for s in snrs],
+                marker="o",
+                markersize=4,
+                label=label,
+            )
+        axis.axvspan(train_low, train_high, color="tab:grey", alpha=0.15)
+        trained = "trained on clean" if encoder == "clean" else f"trained on {encoder}"
+        axis.set_title(trained, fontsize=9)
+        axis.set_xlabel("test SNR (dB)")
+        axis.set_ylim(0, 1)
+        axis.grid(alpha=0.3)
+
+    np.atleast_1d(axes)[0].set_ylabel("identification accuracy")
+    np.atleast_1d(axes)[0].legend(fontsize=8)
+    figure.suptitle(
+        "Does the DSP front-end help? Shaded band = SNR range seen during training"
+    )
+    figure.tight_layout()
+    figure.savefig(config.report_root / "generalisation-matrix.png", dpi=150)
+    plt.close(figure)
+
+
 def render_all(config: ExperimentConfig, rows) -> None:
     config.report_root.mkdir(parents=True, exist_ok=True)
     plot_band_analysis(config)
@@ -391,3 +447,4 @@ def render_all(config: ExperimentConfig, rows) -> None:
     plot_protocol_comparison(config, rows)
     plot_confusion_matrices(config)
     plot_embedding_projection(config)
+    plot_generalisation_matrix(config)

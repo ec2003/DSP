@@ -239,6 +239,83 @@ def evaluate_study(
 
 
 # --------------------------------------------------------------------------- #
+# Generalisation matrix
+# --------------------------------------------------------------------------- #
+def cross_evaluate_study(
+    config: ExperimentConfig, *, workers: int = 8
+) -> list[dict[str, object]]:
+    """Evaluate every encoder against every front-end, over an extended SNR grid.
+
+    The main evaluation is matched: an encoder is only ever shown audio produced
+    by its own front-end, and the SNR range is the one it trained on. That hides
+    the case a front-end is actually for. Here the encoder and the front-end are
+    varied independently, and the grid extends below the training SNR range, so
+    the results show when a front-end earns its cost at inference time.
+    """
+    device = resolve_device()
+    rows: list[dict[str, object]] = []
+
+    for encoder_condition in config.cross_eval_encoders:
+        trained_on_noise = config.condition(encoder_condition).add_noise
+        for seed in config.seeds:
+            checkpoint = config.run_root(seed, encoder_condition) / "encoder.pt"
+            if not checkpoint.is_file():
+                print(f"  skip encoder {encoder_condition} seed {seed}: no checkpoint")
+                continue
+            model = load_encoder(config, checkpoint, device)
+
+            for frontend in config.cross_eval_frontends:
+                for snr_db in config.cross_eval_snr_db:
+                    waveforms, records = prepared_split(
+                        config, "test", frontend, seed, snr_db=snr_db, workers=workers
+                    )
+                    embeddings = extract_embeddings(model, waveforms, device)
+                    labels, names = speaker_labels(records)
+                    enrol, query = enrollment_split(records, config.enrollment_clips)
+                    truth, prediction, _ = nearest_centroid_predict(
+                        embeddings, labels, enrol, query
+                    )
+                    metrics = classification_metrics(truth, prediction)
+                    rows.append(
+                        {
+                            "encoder": encoder_condition,
+                            "encoder_trained_on_noise": trained_on_noise,
+                            "frontend": frontend,
+                            "frontend_stages": "+".join(
+                                config.condition(frontend).stages
+                            )
+                            or "none",
+                            "seed": seed,
+                            "test_snr_db": float(snr_db),
+                            "within_training_snr": float(snr_db) in config.train_snr_db,
+                            "accuracy": metrics["accuracy"],
+                            "f1_macro": metrics["f1_macro"],
+                            "n_speakers": len(names),
+                        }
+                    )
+                    print(
+                        f"  encoder {encoder_condition:<12} frontend {frontend:<12} "
+                        f"seed {seed} {snr_db:>5.0f} dB  acc {metrics['accuracy']:.4f}",
+                        flush=True,
+                    )
+            del model
+            torch.cuda.empty_cache()
+
+    config.report_root.mkdir(parents=True, exist_ok=True)
+    (config.report_root / "cross-eval.json").write_text(
+        json.dumps(rows, indent=2) + "\n", encoding="utf-8"
+    )
+    if rows:
+        fieldnames = list(rows[0].keys())
+        lines = [",".join(fieldnames)]
+        lines += [",".join(str(row[key]) for key in fieldnames) for row in rows]
+        (config.report_root / "cross-eval.csv").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Analysis
 # --------------------------------------------------------------------------- #
 def collect_metrics(config: ExperimentConfig) -> list[dict[str, object]]:

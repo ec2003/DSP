@@ -54,6 +54,17 @@ class ExperimentConfig:
     train_snr_db: tuple[float, ...]
     test_snr_db: tuple[float, ...]
 
+    # MUSAN recordings are partitioned train/validation/test before any segment
+    # is cut, so an encoder is never tested on a noise waveform it trained on.
+    noise_pool_size: int
+    noise_split_fractions: tuple[float, ...]
+
+    # Generalisation matrix: which encoders to reuse, which front-end to feed
+    # them, and an SNR grid that extends below the training range.
+    cross_eval_encoders: tuple[str, ...]
+    cross_eval_frontends: tuple[str, ...]
+    cross_eval_snr_db: tuple[float, ...]
+
     n_fft: int
     hop_length: int
     n_mels: int
@@ -106,6 +117,33 @@ class ExperimentConfig:
         missing = set(self.primary_conditions) - known
         if missing:
             raise ValueError(f"primary_conditions not defined: {sorted(missing)}")
+        if len(self.noise_split_fractions) != 3:
+            raise ValueError(
+                "noise_split_fractions needs three entries (train, validation, "
+                f"test), got {self.noise_split_fractions}"
+            )
+        if (
+            min(self.noise_split_fractions) <= 0
+            or abs(sum(self.noise_split_fractions) - 1.0) > 1e-6
+        ):
+            raise ValueError(
+                f"noise_split_fractions must be positive and sum to 1, got "
+                f"{self.noise_split_fractions}"
+            )
+        unknown = (
+            set(self.cross_eval_encoders) | set(self.cross_eval_frontends)
+        ) - known
+        if unknown:
+            raise ValueError(
+                f"cross-eval refers to undefined conditions: {sorted(unknown)}"
+            )
+        if any(
+            self.condition(name).add_noise is False
+            for name in self.cross_eval_frontends
+        ):
+            raise ValueError(
+                "cross-eval front-ends must add noise; a clean front-end has no SNR axis"
+            )
 
     # -- derived paths ----------------------------------------------------- #
     @property
@@ -140,6 +178,10 @@ def load_config(path: Path) -> ExperimentConfig:
     payload["primary_conditions"] = tuple(payload["primary_conditions"])
     payload["train_snr_db"] = tuple(payload["train_snr_db"])
     payload["test_snr_db"] = tuple(payload["test_snr_db"])
+    payload["noise_split_fractions"] = tuple(payload["noise_split_fractions"])
+    payload["cross_eval_encoders"] = tuple(payload["cross_eval_encoders"])
+    payload["cross_eval_frontends"] = tuple(payload["cross_eval_frontends"])
+    payload["cross_eval_snr_db"] = tuple(payload["cross_eval_snr_db"])
     payload["cnn_channels"] = tuple(payload["cnn_channels"])
     payload["telephone_band_hz"] = tuple(payload["telephone_band_hz"])
     payload["conditions"] = tuple(

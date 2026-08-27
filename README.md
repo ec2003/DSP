@@ -46,11 +46,12 @@ Individual stages, in dependency order:
 
 | Stage | What it does |
 |---|---|
-| `prepare` | Speaker-disjoint splits, deterministic silence-trimmed 16 kHz clip cache, MUSAN noise pool. |
+| `prepare` | Speaker-disjoint splits, deterministic silence-trimmed 16 kHz clip cache, and recording-disjoint MUSAN noise pools (train/validation/test). |
 | `analyse-dsp` | Measures speech/noise band power, derives the cut-offs, and characterises what each arm does to real clips. |
 | `tune` | Grid search on Pipeline A with the first seed; the winner is locked for every arm. |
 | `train` | Trains the CNN encoder for each arm and seed. |
 | `evaluate` | Identification and clustering metrics on unseen test speakers across the SNR grid. |
+| `cross-evaluate` | Generalisation matrix: every encoder against every front-end, on an SNR grid that extends below the training range. |
 | `analyze` | Metric summary CSV, paired significance tests, and all report figures. |
 
 Useful flags: `--condition <arm>` restricts train/evaluate to one arm,
@@ -81,9 +82,9 @@ ablation arms run on the first seed.
 | `configs/dsp501-v2.json` | Every parameter that affects a result. |
 | `src/dsp.py` | IIR filters, tonal-peak detection, STFT Wiener, spectral subtraction. |
 | `src/features.py` | Log-mel, MFCC, Welch PSD, band power, entropy and statistical features. |
-| `src/analysis.py` | Data-driven filter design. |
+| `src/analysis.py` | Data-driven filter design, signal-level front-end characterisation, model-free speaker separability. |
 | `src/corpus.py` | VCTK splits, silence trimming, clip cache. |
-| `src/noise.py` | MUSAN pool and SNR-controlled mixing. |
+| `src/noise.py` | Recording-disjoint MUSAN pools and SNR-controlled mixing. |
 | `src/pipeline.py` | Per-condition front-end assembly. |
 | `src/models.py` | CNN speaker encoder and ArcFace head. |
 | `src/train.py` | Training loop. |
@@ -102,7 +103,9 @@ Pipeline A and then locked, so no arm receives a tuning advantage.
 
 ```bash
 uv run pytest -q          # offline DSP and metric tests, no corpus needed
-quarto render report.qmd  # after a completed run
+
+# Quarto defaults to the system python3; point it at the project environment.
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
 ```
 
 ## Citation

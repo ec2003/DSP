@@ -28,6 +28,13 @@
   "train_snr_db": [0, 5, 10, 15, 20],
   "test_snr_db": [0, 5, 10, 15, 20],
 
+  "noise_pool_size": 2000,
+  "noise_split_fractions": [0.6, 0.15, 0.25],
+
+  "cross_eval_encoders": ["clean", "A_raw_noisy", "B_full"],
+  "cross_eval_frontends": ["A_raw_noisy", "B_full"],
+  "cross_eval_snr_db": [-10, -5, 0, 10, 20],
+
   "n_fft": 512,
   "hop_length": 160,
   "n_mels": 80,

@@ -14,12 +14,20 @@ from pathlib import Path
 
 from src.config import ExperimentConfig, load_config
 
-STAGES = ("prepare", "analyse-dsp", "tune", "train", "evaluate", "analyze")
+STAGES = (
+    "prepare",
+    "analyse-dsp",
+    "tune",
+    "train",
+    "evaluate",
+    "cross-evaluate",
+    "analyze",
+)
 
 
 def stage_prepare(config: ExperimentConfig, args: argparse.Namespace) -> None:
     from src.corpus import build_corpus_cache
-    from src.noise import build_noise_pool
+    from src.noise import build_noise_pools
 
     seed = config.seeds[0]
     manifests = build_corpus_cache(
@@ -34,20 +42,27 @@ def stage_prepare(config: ExperimentConfig, args: argparse.Namespace) -> None:
         validation_speakers=config.validation_speakers,
         closed_set_clips=config.closed_set_clips,
     )
-    pool_path = build_noise_pool(
+    pool_paths = build_noise_pools(
         Path(config.musan_root),
         config.cache_root,
         seed=seed,
         sample_rate=config.sample_rate,
         segment_seconds=config.segment_seconds,
+        split_fractions=config.noise_split_fractions,
+        pool_size=config.noise_pool_size,
     )
     for split, path in manifests.items():
         print(f"  manifest {split}: {path}")
-    print(f"  noise pool: {pool_path}")
+    for partition, path in pool_paths.items():
+        print(f"  noise pool {partition}: {path}")
 
 
 def stage_analyse_dsp(config: ExperimentConfig, args: argparse.Namespace) -> None:
-    from src.analysis import analyse_bands, analyse_dsp_effect
+    from src.analysis import (
+        analyse_bands,
+        analyse_dsp_effect,
+        analyse_speaker_discriminability,
+    )
 
     bands = analyse_bands(config)
     print(json.dumps(bands["recommended_cutoffs"], indent=2))
@@ -60,6 +75,16 @@ def stage_analyse_dsp(config: ExperimentConfig, args: argparse.Namespace) -> Non
             print(
                 f"    {row['condition']:<18} SNR gain {row['snr_gain_db']:+.2f} dB, "
                 f"clean-path distortion {row['clean_path_snr_db']:.2f} dB"
+            )
+
+    discriminability = analyse_speaker_discriminability(config)
+    print(f"  model-free speaker separability at {hardest:.0f} dB input:")
+    for row in discriminability["measurements"]:
+        if row["input_snr_db"] == hardest:
+            print(
+                f"    {row['condition']:<18} Fisher {row['fisher_ratio']:.4f}  "
+                f"(within {row['within_speaker_scatter']:.3f}, "
+                f"between {row['between_speaker_scatter']:.3f})"
             )
 
 
@@ -85,6 +110,13 @@ def stage_evaluate(config: ExperimentConfig, args: argparse.Namespace) -> None:
     evaluate_study(config, workers=args.workers, only=args.condition)
 
 
+def stage_cross_evaluate(config: ExperimentConfig, args: argparse.Namespace) -> None:
+    from src.study import cross_evaluate_study
+
+    rows = cross_evaluate_study(config, workers=args.workers)
+    print(f"  wrote {len(rows)} generalisation-matrix rows")
+
+
 def stage_analyze(config: ExperimentConfig, args: argparse.Namespace) -> None:
     from src.study import analyze_study
 
@@ -97,6 +129,7 @@ DISPATCH = {
     "tune": stage_tune,
     "train": stage_train,
     "evaluate": stage_evaluate,
+    "cross-evaluate": stage_cross_evaluate,
     "analyze": stage_analyze,
 }
 

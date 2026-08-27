@@ -7,8 +7,13 @@ energy at each band edge, and only cuts where the discarded region is genuinely
 noise-dominated.
 
 The second analysis measures what each arm does to real clips: how much noise it
-removes, and how much it distorts the speech while doing so. Those two numbers
-explain the downstream recognition results.
+removes, and how much it distorts the speech while doing so.
+
+The third analysis is model-free. Waveform SNR says how close the processed
+signal is to the clean one in energy terms, which turns out not to predict
+recognition. The Fisher ratio below instead measures how separable the speakers
+are in a fixed cepstral feature space, with no trained encoder involved, and so
+isolates how much speaker-discriminative information the front-end preserves.
 """
 
 from __future__ import annotations
@@ -19,8 +24,15 @@ import numpy as np
 
 from src.config import ExperimentConfig
 from src.corpus import ClipRecord, load_clips, load_manifest
-from src.features import OCTAVE_BAND_EDGES, band_power, residual_snr_db, welch_psd
-from src.noise import load_noise_pool, mix_at_snr, noise_for_sample
+from src.features import (
+    OCTAVE_BAND_EDGES,
+    band_power,
+    mfcc_frames,
+    mfcc_statistics,
+    residual_snr_db,
+    welch_psd,
+)
+from src.noise import load_noise_pool_for_split, mix_at_snr, noise_for_sample
 from src.pipeline import build_chain
 
 #: Fraction of total speech energy we accept discarding at each band edge.
@@ -30,6 +42,9 @@ SPEECH_ENERGY_MARGIN = 0.01
 
 #: Clips sampled when characterising the front-end at the signal level.
 DSP_EFFECT_CLIPS = 200
+
+#: Clips sampled for the model-free speaker-separability measurement.
+DISCRIMINABILITY_CLIPS = 900
 
 
 def average_psd(
@@ -57,7 +72,8 @@ def _cutoffs_from_cumulative_energy(
 def analyse_bands(config: ExperimentConfig) -> dict[str, object]:
     """Measure speech vs noise band power and recommend high-pass / low-pass cutoffs."""
     speech = load_clips(config.cache_root, "train")
-    noise = load_noise_pool(config.cache_root)
+    # Cutoffs are a design decision, so they may only look at training noise.
+    noise = load_noise_pool_for_split(config.cache_root, "train")
 
     freqs, speech_psd = average_psd(speech, config.sample_rate)
     _, noise_psd = average_psd(noise, config.sample_rate)
@@ -138,7 +154,7 @@ def analyse_dsp_effect(config: ExperimentConfig) -> dict[str, object]:
     """
     records: list[ClipRecord] = load_manifest(config.cache_root, "test")
     clips = load_clips(config.cache_root, "test")
-    pool = load_noise_pool(config.cache_root)
+    pool = load_noise_pool_for_split(config.cache_root, "test")
     seed = config.seeds[0]
     n_clips = min(DSP_EFFECT_CLIPS, len(records))
 
@@ -181,6 +197,81 @@ def analyse_dsp_effect(config: ExperimentConfig) -> dict[str, object]:
     report = {"n_clips": n_clips, "seed": seed, "measurements": rows}
     config.report_root.mkdir(parents=True, exist_ok=True)
     (config.report_root / "dsp-effect.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return report
+
+
+def _fisher_ratio(features: np.ndarray, labels: np.ndarray) -> dict[str, float]:
+    """Between-speaker scatter over within-speaker scatter, per feature dimension.
+
+    Standardising first makes the ratio comparable across arms that change the
+    overall feature scale (band limiting does exactly that).
+    """
+    features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-8)
+    grand_mean = features.mean(axis=0)
+
+    within, between = [], []
+    for label in np.unique(labels):
+        group = features[labels == label]
+        within.append(np.sum(group.var(axis=0)) * len(group))
+        between.append(np.sum((group.mean(axis=0) - grand_mean) ** 2) * len(group))
+
+    within_scatter = float(np.sum(within) / len(features))
+    between_scatter = float(np.sum(between) / len(features))
+    return {
+        "within_speaker_scatter": within_scatter,
+        "between_speaker_scatter": between_scatter,
+        "fisher_ratio": between_scatter / (within_scatter + 1e-12),
+    }
+
+
+def analyse_speaker_discriminability(config: ExperimentConfig) -> dict[str, object]:
+    """Measure speaker separability in a fixed cepstral space, with no model.
+
+    Waveform SNR measures energy-domain fidelity; this measures whether the
+    speakers are still told apart after the front-end. The two can disagree,
+    and where they do the recognition results follow this measure.
+    """
+    records: list[ClipRecord] = load_manifest(config.cache_root, "test")
+    clips = load_clips(config.cache_root, "test")
+    pool = load_noise_pool_for_split(config.cache_root, "test")
+    seed = config.seeds[0]
+    n_clips = min(DISCRIMINABILITY_CLIPS, len(records))
+
+    speakers = sorted({record.speaker_id for record in records[:n_clips]})
+    labels = np.array([speakers.index(records[i].speaker_id) for i in range(n_clips)])
+    probe_snrs = (min(config.test_snr_db), max(config.test_snr_db))
+
+    rows = []
+    for condition in config.conditions:
+        chain = build_chain(condition, config)
+        for input_snr in probe_snrs:
+            features = []
+            for index in range(n_clips):
+                signal = clips[index]
+                if condition.add_noise:
+                    signal = mix_at_snr(
+                        signal,
+                        noise_for_sample(records[index].sample_id, seed, pool),
+                        input_snr,
+                    )
+                features.append(
+                    mfcc_statistics(mfcc_frames(chain(signal), config.sample_rate))
+                )
+            rows.append(
+                {
+                    "condition": condition.name,
+                    "stages": list(condition.stages),
+                    "input_snr_db": float(input_snr),
+                    **_fisher_ratio(np.stack(features), labels),
+                }
+            )
+            if not condition.add_noise:
+                break  # the clean arm has no SNR axis
+
+    report = {"n_clips": n_clips, "n_speakers": len(speakers), "measurements": rows}
+    (config.report_root / "discriminability.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
     return report

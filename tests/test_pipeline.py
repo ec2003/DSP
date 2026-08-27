@@ -5,6 +5,8 @@ These run without the corpus so they stay fast and independent of the cache.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -18,7 +20,13 @@ from src.eval import (
     paired_significance,
 )
 from src.features import handcrafted_features, octave_band_powers, spectral_entropy
-from src.noise import deterministic_choice, mix_at_snr
+from src.noise import (
+    NOISE_PARTITIONS,
+    SPLIT_NOISE_PARTITION,
+    deterministic_choice,
+    mix_at_snr,
+    split_noise_files,
+)
 from src.pipeline import build_chain
 
 SAMPLE_RATE = 16000
@@ -153,6 +161,34 @@ def test_deterministic_choice_is_stable_and_in_range():
     )
     assert 0 <= deterministic_choice("11:p225/clip-000:noise", 2000) < 2000
     assert deterministic_choice("a", 100) != deterministic_choice("b", 100)
+
+
+def test_noise_partitions_share_no_recording():
+    files = [
+        Path(f"musan/noise/{corpus}/noise-{index:04d}.wav")
+        for corpus in ("free-sound", "sound-bible")
+        for index in range(200)
+    ]
+    partitions = split_noise_files(files, seed=11, fractions=(0.6, 0.15, 0.25))
+
+    selected = [set(partitions[name]) for name in NOISE_PARTITIONS]
+    assert set().union(*selected) == set(files)
+    for left in range(len(selected)):
+        for right in range(left + 1, len(selected)):
+            assert not selected[left] & selected[right]
+
+    # Stratified: every partition keeps both MUSAN sub-corpora.
+    for group in selected:
+        assert {path.parent.name for path in group} == {"free-sound", "sound-bible"}
+
+    assert split_noise_files(files, 11, (0.6, 0.15, 0.25)) == partitions
+
+
+def test_evaluation_splits_never_use_training_noise():
+    assert SPLIT_NOISE_PARTITION["train"] == "train"
+    assert SPLIT_NOISE_PARTITION["test"] == "test"
+    assert SPLIT_NOISE_PARTITION["seen_test"] == "test"
+    assert SPLIT_NOISE_PARTITION["validation"] == "validation"
 
 
 # --------------------------------------------------------------------------- #
