@@ -99,6 +99,17 @@
   "epochs": 18,
   "weight_decay": 0.00002,
   "optimizer": "adamw",
+  "tune_learning_rates": [
+    0.0003,
+    0.001,
+    0.003
+  ],
+  "tune_arcface_margins": [
+    0.1,
+    0.2,
+    0.3
+  ],
+  "tune_epochs": 10,
   "enrollment_clips": 10,
   "closed_set_clips": 30,
   "cluster_min_size": 5,

@@ -22,7 +22,9 @@ class Condition:
     def __post_init__(self) -> None:
         unknown = set(self.stages) - KNOWN_STAGES
         if unknown:
-            raise ValueError(f"condition {self.name!r} has unknown stages: {sorted(unknown)}")
+            raise ValueError(
+                f"condition {self.name!r} has unknown stages: {sorted(unknown)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,9 @@ class ExperimentConfig:
     epochs: int
     weight_decay: float
     optimizer: str
+    tune_learning_rates: tuple[float, ...]
+    tune_arcface_margins: tuple[float, ...]
+    tune_epochs: int
     enrollment_clips: int
     closed_set_clips: int
     cluster_min_size: int
@@ -86,10 +91,20 @@ class ExperimentConfig:
             raise ValueError("train_snr_range_db must be increasing and non-negative")
         names = tuple(condition.name for condition in self.conditions)
         if names != FACTORIAL_CELLS:
-            raise ValueError(f"conditions must be exactly {FACTORIAL_CELLS}, got {names}")
-        if len(self.noise_split_fractions) != 3 or min(self.noise_split_fractions) <= 0 or abs(sum(self.noise_split_fractions) - 1) > 1e-6:
-            raise ValueError("noise_split_fractions must be three positive values summing to 1")
-        if not set(self.train_noise_families) <= set(MUSAN_FAMILIES) or not set(self.test_noise_families) <= set(MUSAN_FAMILIES):
+            raise ValueError(
+                f"conditions must be exactly {FACTORIAL_CELLS}, got {names}"
+            )
+        if (
+            len(self.noise_split_fractions) != 3
+            or min(self.noise_split_fractions) <= 0
+            or abs(sum(self.noise_split_fractions) - 1) > 1e-6
+        ):
+            raise ValueError(
+                "noise_split_fractions must be three positive values summing to 1"
+            )
+        if not set(self.train_noise_families) <= set(MUSAN_FAMILIES) or not set(
+            self.test_noise_families
+        ) <= set(MUSAN_FAMILIES):
             raise ValueError(f"noise families must be drawn from {MUSAN_FAMILIES}")
         if not self.train_noise_families or not self.test_noise_families:
             raise ValueError("at least one train and test noise family is required")
@@ -100,11 +115,23 @@ class ExperimentConfig:
         if self.bandpass_order < 1:
             raise ValueError("bandpass_order must be positive")
         if self.enrollment_clips >= self.eval_clips_per_speaker:
-            raise ValueError("enrollment_clips must be smaller than eval_clips_per_speaker")
+            raise ValueError(
+                "enrollment_clips must be smaller than eval_clips_per_speaker"
+            )
         if self.closed_set_clips and self.enrollment_clips >= self.closed_set_clips:
             raise ValueError("enrollment_clips must be smaller than closed_set_clips")
         if self.bootstrap_replicates < 100:
             raise ValueError("bootstrap_replicates must be at least 100")
+        if not self.tune_learning_rates or not self.tune_arcface_margins:
+            raise ValueError(
+                "the hyperparameter grid must contain at least one learning rate and one margin"
+            )
+        if min(self.tune_learning_rates) <= 0 or min(self.tune_arcface_margins) <= 0:
+            raise ValueError(
+                "searched learning rates and ArcFace margins must be positive"
+            )
+        if not 1 <= self.tune_epochs <= self.epochs:
+            raise ValueError("tune_epochs must lie in [1, epochs]")
 
     @property
     def study_root(self) -> Path:
@@ -119,12 +146,24 @@ class ExperimentConfig:
         """Stable identity for artifacts materialised by the prepare stage."""
         payload = asdict(self)
         keys = (
-            "vctk_root", "musan_root", "sample_rate",
-            "segment_seconds", "clips_per_speaker", "eval_clips_per_speaker",
-            "train_speakers", "validation_speakers", "seeds", "noise_pool_size",
-            "noise_split_fractions", "closed_set_clips",
+            "vctk_root",
+            "musan_root",
+            "sample_rate",
+            "segment_seconds",
+            "clips_per_speaker",
+            "eval_clips_per_speaker",
+            "train_speakers",
+            "validation_speakers",
+            "seeds",
+            "noise_pool_size",
+            "noise_split_fractions",
+            "closed_set_clips",
         )
-        return sha256(json.dumps({key: payload[key] for key in keys}, sort_keys=True, default=list).encode()).hexdigest()[:16]
+        return sha256(
+            json.dumps(
+                {key: payload[key] for key in keys}, sort_keys=True, default=list
+            ).encode()
+        ).hexdigest()[:16]
 
     @property
     def config_hash(self) -> str:
@@ -132,7 +171,9 @@ class ExperimentConfig:
         payload = asdict(self)
         payload.pop("output_root", None)
         payload.pop("run_id", None)
-        return sha256(json.dumps(payload, sort_keys=True, default=list).encode()).hexdigest()
+        return sha256(
+            json.dumps(payload, sort_keys=True, default=list).encode()
+        ).hexdigest()
 
     @property
     def run_tag(self) -> str:
@@ -151,6 +192,10 @@ class ExperimentConfig:
     @property
     def dsp_design_path(self) -> Path:
         return self.run_dir / "dsp-design.json"
+
+    @property
+    def tuning_path(self) -> Path:
+        return self.run_dir / "tuning-summary.json"
 
     @property
     def manifest_path(self) -> Path:
@@ -177,9 +222,17 @@ class ExperimentConfig:
 def load_config(path: Path | str) -> ExperimentConfig:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     for key in (
-        "seeds", "train_snr_range_db", "test_snr_db", "noise_split_fractions",
-        "train_noise_families", "test_noise_families", "babble_sources_range",
-        "positive_control_snr_db", "cnn_channels",
+        "seeds",
+        "train_snr_range_db",
+        "test_snr_db",
+        "noise_split_fractions",
+        "train_noise_families",
+        "test_noise_families",
+        "babble_sources_range",
+        "positive_control_snr_db",
+        "cnn_channels",
+        "tune_learning_rates",
+        "tune_arcface_margins",
     ):
         payload[key] = tuple(payload[key])
     payload["conditions"] = tuple(

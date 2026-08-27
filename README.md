@@ -43,13 +43,19 @@ Stages:
 | Stage | Output |
 |---|---|
 | `prepare` | speaker-disjoint VCTK clips and recording-disjoint MUSAN pools in `cache/<data-config-hash>/` |
-| `eda` | frozen run-local `dsp-design.json` and retained-energy design summary |
-| `train` | only `runs/run-N/seed-*/robust_cnn/encoder.pt` checkpoints |
-| `evaluate_raw` | raw-only clean/noisy, unseen/seen reports |
-| `evaluate_dsp` | bandpass, Wiener, and combined reports matched to raw |
+| `eda` | frozen run-local `dsp-design.json`, retained-energy summary, passband and signal-gallery figures |
+| `tune` | `tuning-summary.json`: learning-rate × ArcFace-margin grid scored on validation speakers only |
+| `train` | only `runs/run-N/seed-*/robust_cnn/encoder.pt` checkpoints, using the tuned hyperparameters |
+| `evaluate_raw` | Pipeline A (`raw`) clean/noisy, unseen/seen reports |
+| `evaluate_dsp` | Pipeline B (`bandpass_wiener`) and its `bandpass` / `wiener` ablations, matched to Pipeline A |
 | `signal_analysis` | Wiener positive control and front-end waveform characterization |
 | `statistics` | metric CSV and paired speaker-cluster bootstrap factorial effects |
-| `figures` | report-ready PNG charts from persisted results |
+| `figures` | SNR curves, factorial effects, confusion matrices, SNR/recognition trade-off |
+
+Hyperparameters are searched by the `tune` phase and never read from `config.json`
+at training time: `configs/config.json` only declares the grid
+(`tune_learning_rates`, `tune_arcface_margins`, `tune_epochs`). Trials are scored
+on the validation speakers, so the test protocol cannot leak into model selection.
 
 The frozen band-pass is derived only from training speech and training MUSAN pools.
 Its artifact contains the selected edges, inputs, rule and config hash; front-end
@@ -61,5 +67,7 @@ it does not treat seed×SNR cells as independent experiments.
 `runs/run-N/config.json` is the exact copied input configuration and its
 `run-manifest.json` records hashes, git revision, phase attempts, outputs,
 checkpoints, and failures. `main.ipynb` creates a new run when `RUN_ID = None`;
-an integer resumes only its failed or pending phase. Quarto only reads a selected
-run's snapshot and artifacts.
+an integer resumes only its failed or pending phase. Each notebook section owns
+one phase and shows its own tables and figures. `report.qmd` reads a single
+completed run selected by `RUN_ID` at the top of its first chunk and never
+trains or evaluates anything.
