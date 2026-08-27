@@ -251,6 +251,9 @@ def cross_evaluate_study(
     the case a front-end is actually for. Here the encoder and the front-end are
     varied independently, and the grid extends below the training SNR range, so
     the results show when a front-end earns its cost at inference time.
+
+    A front-end that adds no noise has no SNR axis and is evaluated once; that
+    cell measures what training on noise costs on clean audio.
     """
     device = resolve_device()
     rows: list[dict[str, object]] = []
@@ -265,7 +268,9 @@ def cross_evaluate_study(
             model = load_encoder(config, checkpoint, device)
 
             for frontend in config.cross_eval_frontends:
-                for snr_db in config.cross_eval_snr_db:
+                frontend_adds_noise = config.condition(frontend).add_noise
+                grid = config.cross_eval_snr_db if frontend_adds_noise else (None,)
+                for snr_db in grid:
                     waveforms, records = prepared_split(
                         config, "test", frontend, seed, snr_db=snr_db, workers=workers
                     )
@@ -286,16 +291,18 @@ def cross_evaluate_study(
                             )
                             or "none",
                             "seed": seed,
-                            "test_snr_db": float(snr_db),
-                            "within_training_snr": float(snr_db) in config.train_snr_db,
+                            "test_snr_db": None if snr_db is None else float(snr_db),
+                            "within_training_snr": snr_db is not None
+                            and float(snr_db) in config.train_snr_db,
                             "accuracy": metrics["accuracy"],
                             "f1_macro": metrics["f1_macro"],
                             "n_speakers": len(names),
                         }
                     )
+                    level = "clean" if snr_db is None else f"{snr_db:>5.0f} dB"
                     print(
                         f"  encoder {encoder_condition:<12} frontend {frontend:<12} "
-                        f"seed {seed} {snr_db:>5.0f} dB  acc {metrics['accuracy']:.4f}",
+                        f"seed {seed} {level:>8}  acc {metrics['accuracy']:.4f}",
                         flush=True,
                     )
             del model

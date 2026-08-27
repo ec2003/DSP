@@ -137,13 +137,6 @@ class ExperimentConfig:
             raise ValueError(
                 f"cross-eval refers to undefined conditions: {sorted(unknown)}"
             )
-        if any(
-            self.condition(name).add_noise is False
-            for name in self.cross_eval_frontends
-        ):
-            raise ValueError(
-                "cross-eval front-ends must add noise; a clean front-end has no SNR axis"
-            )
 
     # -- derived paths ----------------------------------------------------- #
     @property

@@ -405,6 +405,9 @@ def plot_generalisation_matrix(config: ExperimentConfig) -> None:
         for frontend in config.cross_eval_frontends:
             grouped = defaultdict(list)
             for row in rows:
+                # The clean front-end has no SNR axis; it is reported separately.
+                if row["test_snr_db"] is None:
+                    continue
                 if row["encoder"] == encoder and row["frontend"] == frontend:
                     grouped[row["test_snr_db"]].append(row["accuracy"])
             if not grouped:

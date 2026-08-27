@@ -1,0 +1,855 @@
+---
+title: "Designing a Noise-Robust DSP Front-End for Speaker Embedding Learning"
+subtitle: "DSP501 Final Assignment"
+author: "[Group name; student names and IDs]"
+date: last-modified
+format:
+  html:
+    embed-resources: true
+    toc: true
+    number-sections: true
+  pdf:
+    toc: true
+    number-sections: true
+bibliography: references.bib
+execute:
+  echo: false
+  warning: false
+---
+
+```{python}
+# | label: load-artifacts
+from __future__ import annotations
+
+import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+
+from IPython.display import Markdown, display
+
+PROJECT_ROOT = Path.cwd().resolve()
+CONFIG = json.loads((PROJECT_ROOT / "configs" / "dsp501-v2.json").read_text(encoding="utf-8"))
+STUDY_ROOT = PROJECT_ROOT / CONFIG["output_root"] / CONFIG["study_id"]
+REPORTS = STUDY_ROOT / "reports"
+
+REQUIRED = {
+    "metric summary": REPORTS / "metric-summary.csv",
+    "significance tests": REPORTS / "significance.json",
+    "band analysis": REPORTS / "band-analysis.json",
+    "front-end characterisation": REPORTS / "dsp-effect.json",
+    "tuning result": STUDY_ROOT / "tuning.json",
+}
+missing = [f"{name} ({path})" for name, path in REQUIRED.items() if not path.is_file()]
+if missing:
+    raise FileNotFoundError(
+        "This report renders from saved artifacts. Run "
+        "`uv run python run.py all --config configs/dsp501-v2.json` first.\nMissing:\n- "
+        + "\n- ".join(missing)
+    )
+
+with (REPORTS / "metric-summary.csv").open(newline="", encoding="utf-8") as stream:
+    METRICS = list(csv.DictReader(stream))
+SIGNIFICANCE = json.loads((REPORTS / "significance.json").read_text(encoding="utf-8"))
+BANDS = json.loads((REPORTS / "band-analysis.json").read_text(encoding="utf-8"))
+DSP_EFFECT = json.loads((REPORTS / "dsp-effect.json").read_text(encoding="utf-8"))
+TUNING = json.loads((STUDY_ROOT / "tuning.json").read_text(encoding="utf-8"))
+NOISE_SPLIT = json.loads(
+    (STUDY_ROOT / "cache" / "noise-pool.json").read_text(encoding="utf-8")
+)
+
+
+def optional(path: Path):
+    """Artifacts from stages a reader may choose not to run."""
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+CROSS_EVAL = optional(REPORTS / "cross-eval.json")
+DISCRIMINABILITY = optional(REPORTS / "discriminability.json")
+
+
+def cross(encoder: str, frontend: str, snr: float | None) -> float | None:
+    """Mean cross-evaluation accuracy over seeds; ``snr=None`` is the clean cell."""
+    values = [
+        row["accuracy"]
+        for row in (CROSS_EVAL or [])
+        if row["encoder"] == encoder
+        and row["frontend"] == frontend
+        and row["test_snr_db"] == snr
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def fmt(value: float | None, places: int = 4, sign: bool = False) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.{places}f}" if sign else f"{value:.{places}f}"
+
+
+def mean_by(
+    condition: str, metric: str, model: str = "cnn", protocol: str = "unseen"
+) -> float | None:
+    values = [
+        float(row[metric])
+        for row in METRICS
+        if row["condition"] == condition
+        and row["model"] == model
+        and row.get("protocol", "unseen") == protocol
+        and row[metric]
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def table(rows: list[list[object]], header: list[str]) -> Markdown:
+    body = "\n".join("| " + " | ".join(str(cell) for cell in row) + " |" for row in rows)
+    return Markdown(
+        "| " + " | ".join(header) + " |\n"
+        "|" + "|".join(["---"] * len(header)) + "|\n" + body
+    )
+```
+
+# Abstract
+
+Speaker recognition systems degrade sharply when the input is contaminated by
+environmental noise. This study asks whether a *designed* digital signal
+processing (DSP) front-end — rather than a conventional one — measurably
+improves a learned speaker embedding under additive MUSAN noise. We derive the
+band limits of the front-end empirically from the measured long-term spectra of
+VCTK speech and MUSAN noise, add an adaptive notch stage targeting the tonal
+components we observe in MUSAN, and apply a Wiener filter with decision-directed
+a-priori SNR estimation in the STFT domain. A convolutional speaker encoder is
+trained from scratch with an ArcFace objective under each front-end
+configuration and evaluated on speaker-disjoint held-out speakers, both by
+enrolment-based identification and by unsupervised clustering. The MUSAN
+recordings are partitioned before mixing, so no encoder is tested on a noise
+waveform it trained on, and the encoder is additionally evaluated against
+front-ends other than its own on an SNR grid extending below the training range.
+
+**Keywords** — digital signal processing, speaker embedding, Wiener filtering,
+spectral analysis, noise robustness, MUSAN, VCTK
+
+# Introduction
+
+<!-- TODO(author): motivate speaker recognition in noisy deployments, and state
+     the contribution in 2-3 paragraphs. -->
+
+# Research problem
+
+Learned speaker embeddings are usually evaluated on clean or lightly augmented
+audio. When they are deployed on noisy recordings, performance falls, and the
+usual remedy is to add more training data rather than to improve the signal
+representation. The specific problem addressed here is: **for a speaker
+embedding trained on noisy VCTK speech, which DSP front-end stages actually
+recover speaker-discriminative information, and how much?**
+
+# Research objectives
+
+1. Design a DSP front-end whose parameters are derived from the measured
+   spectra of the target speech and noise, rather than assumed from convention.
+2. Quantify the contribution of each front-end stage to speaker-embedding
+   quality across a range of test SNRs.
+3. Establish whether any deployment condition justifies the front-end, by
+   varying the encoder and the front-end independently and testing outside the
+   SNR range the encoder was trained on.
+
+# Research questions
+
+**RQ1.** How does additive MUSAN noise degrade speaker-embedding quality across
+0–20 dB test SNR, measured by both identification accuracy and clustering
+agreement?
+
+**RQ2.** Which individual DSP stages (band limiting, adaptive notch, STFT Wiener
+filtering) contribute to recovering that degradation, and are the contributions
+additive?
+
+**RQ3.** Does a learned embedding outperform a classical DSP-only representation
+(MFCC and band-power statistics with cosine scoring) under the same front-end?
+
+**RQ4.** Is there any operating point — encoder training condition × inference
+front-end × test SNR, including SNRs below the training range — at which the
+designed front-end yields higher accuracy than applying no front-end at all?
+
+**H1.** The full designed front-end (Pipeline B) yields significantly higher
+macro F1 than the raw-noisy baseline (Pipeline A) at low test SNR, tested by a
+paired test across seeds and SNRs.
+
+**H2.** Aggressive band limiting to the telephone band (300–3400 Hz) reduces
+embedding quality relative to Pipeline B, because speaker-discriminative detail
+lies outside the intelligibility-optimised band.
+
+# Literature review
+
+<!-- TODO(author): 8-12 publications from 2021-2026; at least 3 journal, 3
+     conference, 2 survey. Compare DSP techniques across papers, then compare AI
+     approaches. Do not list summaries. The Literature Matrix goes in Appendix A. -->
+
+# Research gap
+
+<!-- TODO(author): state the gap this study addresses, grounded in the review
+     above. -->
+
+# Expected contributions
+
+1. A reproducible, data-driven procedure for choosing front-end band limits from
+   measured speech and noise spectra, rather than from convention.
+2. A stage-by-stage ablation quantifying which DSP operations help a learned
+   speaker embedding, evaluated on speakers never seen during training.
+3. A dual evaluation protocol combining supervised enrolment metrics with
+   unsupervised clustering of the same embeddings.
+
+# Methodology
+
+## Research framework
+
+```{mermaid}
+flowchart LR
+    A[Research problem<br/>noise-robust speaker embedding] --> B[Dataset<br/>VCTK 0.80 + MUSAN noise]
+    B --> C[DSP preprocessing<br/>band limit, notch, Wiener]
+    C --> D[Feature extraction<br/>log-mel, MFCC, PSD, entropy]
+    D --> E[Model<br/>CNN encoder + ArcFace]
+    E --> F[Evaluation<br/>identification + clustering]
+```
+
+## Dataset
+
+```{python}
+# | label: dataset-table
+display(
+    table(
+        [
+            ["Speech corpus", "VCTK 0.80, 109 speakers, 48 kHz WAV"],
+            ["Noise corpus", "MUSAN `noise` subset"],
+            ["Resampled to", f"{CONFIG['sample_rate']} Hz mono"],
+            ["Clip length", f"{CONFIG['segment_seconds']} s after silence trimming"],
+            ["Training clips per speaker", CONFIG["clips_per_speaker"]],
+            ["Evaluation clips per speaker", CONFIG["eval_clips_per_speaker"]],
+            ["Train speakers", CONFIG["train_speakers"]],
+            ["Validation speakers", CONFIG["validation_speakers"]],
+            ["Test speakers", f"{109 - CONFIG['train_speakers'] - CONFIG['validation_speakers']} (disjoint)"],
+            ["Noise recordings", " / ".join(f"{p['n_files']} {name}" for name, p in NOISE_SPLIT.items())],
+            ["Seeds", ", ".join(str(s) for s in CONFIG["seeds"])],
+            ["Test SNRs", ", ".join(f"{s} dB" for s in CONFIG["test_snr_db"])],
+        ],
+        ["Item", "Value"],
+    )
+)
+```
+
+Speaker sets are disjoint across train, validation, and test. Evaluation therefore
+measures generalisation to *unseen speakers*, which is what makes unsupervised
+clustering a meaningful measure of embedding quality.
+
+The MUSAN recordings are partitioned the same way, before any segment is cut and
+stratified by sub-corpus, so a test clip is never mixed with a noise waveform the
+encoder heard in training. Without this split the noise-trained arm can memorise
+the specific noise realisations rather than learn robustness to them, which
+biases the comparison against any front-end.
+
+## DSP preprocessing
+
+Band limits are derived, not assumed. We measure the long-term average PSD of
+the training speech and of the *training* partition of the MUSAN noise pool
+[@vctk; @musan] with Welch's
+method [@welch1967], normalise both to equal total power (a globally 0 dB
+mixture), and choose the cut-off frequencies that discard at most 1% of the
+speech energy at each band edge.
+
+```{python}
+# | label: band-table
+display(
+    table(
+        [
+            [
+                f"{int(b['low_hz'])}–{int(b['high_hz'])}",
+                f"{b['speech_power_pct']:.2f}",
+                f"{b['noise_power_pct']:.2f}",
+                f"{b['band_snr_db']:+.2f}",
+            ]
+            for b in BANDS["bands"]
+        ],
+        ["Band (Hz)", "Speech power (%)", "Noise power (%)", "Band SNR (dB)"],
+    )
+)
+cutoffs = BANDS["recommended_cutoffs"]
+display(
+    Markdown(
+        f"\nDerived cut-offs: high-pass **{cutoffs['highpass_hz']} Hz**, "
+        f"low-pass **{cutoffs['lowpass_hz']} Hz**, retaining "
+        f"**{cutoffs['speech_energy_retained_pct']}%** of speech energy but only "
+        f"**{cutoffs['noise_energy_retained_pct']}%** of noise energy."
+    )
+)
+```
+
+![Long-term average spectra with the derived cut-offs, and octave-band speech-to-noise ratio.](outputs/dsp501-speaker-embedding-v2/reports/band-analysis.png){#fig-bands}
+
+The octave-band table shows that MUSAN noise dominates speech both below 125 Hz
+and above roughly 1 kHz, while speech dominates the 125–1000 Hz region that
+carries the fundamental and the first two formants.
+
+Three DSP technique categories from the course table are used inside the
+processing chain, and two more inside feature extraction:
+
+| Stage | Technique category | Design rationale |
+|---|---|---|
+| High-pass Butterworth | IIR digital filtering | Removes the noise-dominated sub-125 Hz region below the speaker F0 range. |
+| Low-pass Butterworth | IIR digital filtering | Removes the noise-dominated high band while retaining formants F1–F3. |
+| Adaptive notch | IIR digital filtering | MUSAN contains narrowband tonal components (visible as spikes in @fig-bands); peaks that exceed the local spectral envelope by a set margin are notched. |
+| STFT Wiener filter | STFT / frequency analysis | Suppresses residual broadband noise in the time–frequency plane. |
+| Welch PSD, band power | Spectral / power | Used for filter design and as classical features. |
+| MFCC | Cepstral | Classical baseline features. |
+| Entropy, RMS, ZCR, spectral shape | Statistical / information | Classical baseline features. |
+
+All Butterworth filters are applied with zero-phase forward–backward filtering,
+so this is an **offline** front-end; no claim is made about causal streaming
+deployment.
+
+![Designed Butterworth magnitude responses.](outputs/dsp501-speaker-embedding-v2/reports/filter-response.png){#fig-filters}
+
+### Wiener filter
+
+The Wiener stage operates on the STFT magnitude. The noise PSD $\hat{N}(f)$ is
+estimated as the mean power of the lowest-energy frames, exploiting the temporal
+sparsity of speech. With posterior SNR $\gamma = |X|^2 / \hat{N}$ and a-priori
+SNR $\xi$ obtained by the decision-directed rule [@ephraim1984]
+
+$$\xi_t = \alpha \frac{|\hat{S}_{t-1}|^2}{\hat{N}} + (1-\alpha)\max(\gamma_t - 1, 0),$$
+
+the applied gain is $G = \max\!\left(\frac{\xi}{1+\xi},\, G_{\min}\right)$. The
+gain floor $G_{\min}$ limits musical-noise artefacts produced when isolated
+spectral bins collapse. The `C_specsub` arm replaces this stage with classical
+magnitude spectral subtraction [@boll1979] to separate the benefit of denoising
+in general from the benefit of this estimator in particular.
+
+![Waveforms at each stage of Pipeline B.](outputs/dsp501-speaker-embedding-v2/reports/waveforms.png){#fig-waveforms}
+
+![STFT magnitude before and after the front-end.](outputs/dsp501-speaker-embedding-v2/reports/spectrograms.png){#fig-spectrograms}
+
+### Signal-level characterisation of the front-end
+
+Before asking what the front-end does to recognition, we measure what it does to
+the signal. Two quantities are reported per arm: the SNR of the processed
+mixture measured against the clean reference (so it charges the arm for residual
+noise *and* for processing artefacts), and the SNR obtained by running the same
+chain on **clean** input, which isolates the distortion the chain injects by
+itself. A perfectly transparent chain would score arbitrarily high on the second
+measure.
+
+```{python}
+# | label: dsp-effect-table
+hardest = min(float(s) for s in CONFIG["test_snr_db"])
+display(
+    table(
+        [
+            [
+                row["condition"],
+                " + ".join(row["stages"]) or "—",
+                f"{row['output_snr_db']:.2f}",
+                f"{row['snr_gain_db']:+.2f}",
+                f"{row['clean_path_snr_db']:.2f}",
+            ]
+            for row in DSP_EFFECT["measurements"]
+            if row["input_snr_db"] == hardest
+        ],
+        [
+            "Arm",
+            "Stages",
+            f"Output SNR at {hardest:.0f} dB in (dB)",
+            "Gain vs A (dB)",
+            "Clean-path SNR (dB)",
+        ],
+    )
+)
+```
+
+![Noise suppression achieved, against the distortion injected into clean speech.](outputs/dsp501-speaker-embedding-v2/reports/dsp-effect.png){#fig-dsp-effect}
+
+## Feature extraction
+
+The learned model consumes an 80-band log-mel spectrogram
+(`n_fft`=512, hop=160), mean–variance normalised per utterance. The classical
+baseline consumes a fixed-width vector of MFCC statistics, octave-band powers,
+spectral shape statistics, and time-domain statistics.
+
+## AI/ML model design
+
+```{python}
+# | label: model-table
+display(
+    table(
+        [
+            ["Encoder", "CNN, 4 conv blocks with channels " + str(CONFIG["cnn_channels"])],
+            ["Pooling", "Attentive statistics (weighted mean and standard deviation)"],
+            ["Embedding", f"{CONFIG['embedding_dim']}-d, L2-normalised"],
+            ["Training objective", f"ArcFace (margin {CONFIG['arcface_margin']}, scale {CONFIG['arcface_scale']})"],
+            ["Optimiser", CONFIG["optimizer"] + f", weight decay {CONFIG['weight_decay']}"],
+            ["Schedule", f"cosine annealing over {CONFIG['epochs']} epochs"],
+            ["Selected learning rate", TUNING["selected"]["learning_rate"]],
+            ["Selected batch size", TUNING["selected"]["batch_size"]],
+        ],
+        ["Item", "Value"],
+    )
+)
+```
+
+The encoder is trained from scratch rather than fine-tuned from a large
+pretrained speaker model. Public pretrained speaker encoders are trained with
+heavy noise augmentation and are therefore already noise-robust, which would
+mask the very effect this study is designed to measure. Attentive statistics
+pooling [@okabe2018] converts the variable-length frame sequence to a fixed
+vector, and the ArcFace objective [@arcface] shapes an embedding space where
+cosine distance is directly meaningful.
+
+# Experimental design
+
+**Independent variable:** the DSP front-end configuration (8 arms below).
+**Dependent variables:** identification accuracy, macro precision, macro recall,
+macro F1, clustering ARI and NMI.
+**Controlled:** every arm shares the same source clips, the same deterministic
+noise segment per clip, the same SNR per clip, the same architecture, the same
+locked hyperparameters, and the same enrolment/query partition.
+
+| Arm | Noise | DSP stages | Role |
+|---|---|---|---|
+| `clean` | no | — | ceiling reference |
+| `A_raw_noisy` | yes | — | **Pipeline A** (minimal DSP) |
+| `B1_hpf` | yes | high-pass | ablation |
+| `B2_hpf_lpf` | yes | + low-pass | ablation |
+| `B3_hpf_lpf_notch` | yes | + notch | ablation |
+| `B_full` | yes | + Wiener | **Pipeline B** (full DSP) |
+| `C_specsub` | yes | Wiener replaced by spectral subtraction | denoiser comparison |
+| `X_telephone` | yes | 300–3400 Hz band-pass | over-filtering control |
+
+Hyperparameters are tuned once on Pipeline A with the first seed and then locked
+for every arm and seed, so no arm receives a tuning advantage.
+
+```{python}
+# | label: tuning-table
+display(
+    table(
+        [
+            [t["learning_rate"], t["batch_size"], f"{t['validation_accuracy']:.4f}"]
+            for t in TUNING["trials"]
+        ],
+        ["Learning rate", "Batch size", "Validation accuracy"],
+    )
+)
+```
+
+## Evaluation protocol
+
+Identification uses an enrolment protocol: for each evaluated speaker the first
+`enrollment_clips` clips form the enrolment set and the remainder are queries,
+scored by cosine nearest centroid and by a linear SVM on the same embeddings.
+Clustering uses agglomerative clustering with the true speaker count (giving
+ARI/NMI that are directly comparable across arms) and HDBSCAN with an unknown
+cluster count (giving an outlier rate that reflects embedding compactness).
+
+The same protocol is applied to two speaker populations:
+
+| Protocol | Population | What it measures |
+|---|---|---|
+| **Closed set** (`seen`) | Held-out *utterances* of the 60 training speakers | Identification among speakers the encoder was fitted to. |
+| **Open set** (`unseen`) | 29 speakers absent from training entirely | Whether the encoder learned a transferable notion of speaker identity. |
+
+Because the enrolment mechanics are identical, the gap between the two is a
+direct measurement of how much of the score comes from speaker-specific fitting
+rather than from a generalisable representation. Unless stated otherwise, all
+results below use the open-set protocol, which is the harder and more
+informative of the two.
+
+# Experimental results
+
+```{python}
+# | label: results-table
+conditions = [
+    "clean", "A_raw_noisy", "B1_hpf", "B2_hpf_lpf",
+    "B3_hpf_lpf_notch", "B_full", "C_specsub", "X_telephone",
+]
+rows = []
+for condition in conditions:
+    accuracy = mean_by(condition, "accuracy")
+    if accuracy is None:
+        continue
+    rows.append(
+        [
+            condition,
+            f"{accuracy:.4f}",
+            f"{mean_by(condition, 'precision_macro'):.4f}",
+            f"{mean_by(condition, 'recall_macro'):.4f}",
+            f"{mean_by(condition, 'f1_macro'):.4f}",
+            f"{mean_by(condition, 'agglomerative_ari'):.4f}",
+            f"{mean_by(condition, 'agglomerative_nmi'):.4f}",
+        ]
+    )
+display(table(rows, ["Arm", "Accuracy", "Precision", "Recall", "F1", "ARI", "NMI"]))
+display(Markdown("\nOpen-set protocol; means over seeds and test SNRs. Higher is better throughout."))
+```
+
+![Embedding quality versus test SNR.](outputs/dsp501-speaker-embedding-v2/reports/snr-curves.png){#fig-snr}
+
+![Stage-by-stage ablation.](outputs/dsp501-speaker-embedding-v2/reports/ablation-f1.png){#fig-ablation}
+
+![Row-normalised confusion matrices at the hardest test SNR.](outputs/dsp501-speaker-embedding-v2/reports/confusion-matrices.png){#fig-confusion}
+
+## Closed set versus open set
+
+The same encoders, the same audio processing and the same enrolment mechanics,
+applied to speakers the encoder was trained on versus speakers it has never
+heard.
+
+```{python}
+# | label: protocol-table
+rows = []
+for condition in ("clean", "A_raw_noisy", "B_full"):
+    seen = mean_by(condition, "accuracy", protocol="seen")
+    unseen = mean_by(condition, "accuracy", protocol="unseen")
+    if seen is None or unseen is None:
+        continue
+    rows.append(
+        [condition, f"{seen:.4f}", f"{unseen:.4f}", f"{seen - unseen:+.4f}"]
+    )
+display(
+    table(
+        rows,
+        ["Arm", "Closed set (seen speakers)", "Open set (unseen speakers)", "Gap"],
+    )
+)
+```
+
+![Closed set against open set across the SNR grid.](outputs/dsp501-speaker-embedding-v2/reports/protocol-comparison.png){#fig-protocol}
+
+<!-- TODO(author): interpret the gap. A large gap means the encoder is fitting
+     the training speakers rather than learning a transferable representation,
+     which is the expected consequence of training on only 60 speakers. State
+     whether the DSP ranking is the same under both protocols; if it is, the
+     conclusion about the front-end does not depend on the protocol choice. -->
+
+## Where the front-end would have to earn its cost
+
+The results above are *matched*: each encoder only ever sees audio produced by
+its own front-end, at the SNR range it trained on. That is the condition least
+favourable to a front-end, because the encoder has already adapted to whatever
+the front-end does. It is also not the condition a front-end is for. A front-end
+is meant to pay off when the inference condition is worse than anything seen in
+training, and when the encoder cannot be retrained.
+
+We therefore vary the encoder and the front-end independently and extend the SNR
+grid below the training range.
+
+```{python}
+# | label: cross-eval-table
+if CROSS_EVAL:
+    grid = sorted({row["test_snr_db"] for row in CROSS_EVAL})
+    rows = []
+    for encoder in CONFIG["cross_eval_encoders"]:
+        for frontend in CONFIG["cross_eval_frontends"]:
+            cells = []
+            for snr in grid:
+                values = [
+                    row["accuracy"]
+                    for row in CROSS_EVAL
+                    if row["encoder"] == encoder
+                    and row["frontend"] == frontend
+                    and row["test_snr_db"] == snr
+                ]
+                cells.append(f"{sum(values) / len(values):.4f}" if values else "—")
+            label = "no DSP" if frontend == "A_raw_noisy" else "full DSP"
+            rows.append([encoder, label, *cells])
+    display(
+        table(rows, ["Encoder", "Front-end", *(f"{s:.0f} dB" for s in grid)])
+    )
+    display(
+        Markdown(
+            "\nOpen-set accuracy, mean over seeds. The training SNR range is "
+            f"{min(CONFIG['train_snr_db'])}–{max(CONFIG['train_snr_db'])} dB; "
+            "columns outside it are out-of-distribution."
+        )
+    )
+```
+
+![Front-end benefit as a function of train/inference mismatch. Shaded band marks the training SNR range.](outputs/dsp501-speaker-embedding-v2/reports/generalisation-matrix.png){#fig-generalisation}
+
+<!-- TODO(author): read the matrix along two axes. Down a column: does adding
+     the front-end at inference time ever raise accuracy for a given encoder?
+     Across the row: does the advantage of the front-end grow as the test SNR
+     falls below the training range? State explicitly whether any cell in the
+     matrix beats the best no-DSP cell, since that is the claim the hypothesis
+     needs. -->
+
+## Model-free check: is the information still there?
+
+Recognition accuracy conflates two things a front-end can do: destroy speaker
+information, or merely present it in a form the encoder was not fitted to. To
+separate them we measure speaker separability with no model at all, as a Fisher
+ratio (between-speaker scatter over within-speaker scatter) in a fixed MFCC
+statistics space, on the same clips at the same SNRs.
+
+```{python}
+# | label: discriminability-table
+if DISCRIMINABILITY:
+    hardest = min(float(s) for s in CONFIG["test_snr_db"])
+    display(
+        table(
+            [
+                [
+                    row["condition"],
+                    " + ".join(row["stages"]) or "—",
+                    f"{row['fisher_ratio']:.4f}",
+                    f"{row['between_speaker_scatter']:.3f}",
+                    f"{row['within_speaker_scatter']:.3f}",
+                ]
+                for row in DISCRIMINABILITY["measurements"]
+                if row["input_snr_db"] == hardest
+            ],
+            [
+                "Arm",
+                "Stages",
+                f"Fisher ratio at {hardest:.0f} dB",
+                "Between-speaker",
+                "Within-speaker",
+            ],
+        )
+    )
+    display(
+        Markdown(
+            f"\nComputed on {DISCRIMINABILITY['n_clips']} open-set clips, "
+            "standardised per feature dimension so the ratio is comparable "
+            "across arms that change the overall feature scale."
+        )
+    )
+```
+
+<!-- TODO(author): compare the ordering here against the accuracy ordering in
+     the results table. If a front-end raises the Fisher ratio while lowering
+     accuracy, the information was not destroyed, and the loss must be
+     attributed to the representation the encoder can exploit rather than to
+     the signal itself. Say which of the two it is, and do not claim more than
+     this measurement supports. -->
+
+## Baseline comparison: learned embedding versus classical DSP-only features
+
+```{python}
+# | label: dsponly-table
+rows = []
+for condition in ("A_raw_noisy", "B_full"):
+    for model, label in (("cnn", "CNN embedding"), ("dsp_only", "DSP-only features")):
+        accuracy = mean_by(condition, "accuracy", model)
+        if accuracy is not None:
+            rows.append(
+                [condition, label, f"{accuracy:.4f}", f"{mean_by(condition, 'f1_macro', model):.4f}"]
+            )
+display(table(rows, ["Arm", "Representation", "Accuracy", "F1"]))
+```
+
+## Statistical significance
+
+```{python}
+# | label: significance-table
+display(
+    table(
+        [
+            [
+                s["metric"],
+                s.get("protocol", "unseen"),
+                s["comparison"],
+                s["n_pairs"],
+                f"{s['mean_difference']:+.4f}",
+                f"[{s['ci_low']:+.4f}, {s['ci_high']:+.4f}]",
+                f"{s['t_p_value']:.4g}",
+                f"{s['wilcoxon_p_value']:.4g}",
+            ]
+            for s in SIGNIFICANCE
+        ],
+        [
+            "Metric",
+            "Protocol",
+            "Comparison",
+            "n",
+            "Mean diff.",
+            "95% CI",
+            "t-test p",
+            "Wilcoxon p",
+        ],
+    )
+)
+```
+
+# Error analysis
+
+```{python}
+# | label: error-analysis
+seed = CONFIG["seeds"][0]
+hardest_snr = int(min(CONFIG["test_snr_db"]))
+for condition in ("A_raw_noisy", "B_full"):
+    path = STUDY_ROOT / f"seed-{seed}" / condition / f"evaluation-snr-{hardest_snr}.json"
+    if not path.is_file():
+        continue
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    display(
+        Markdown(
+            f"\n**{condition} at {hardest_snr} dB — most frequently confused speaker pairs**\n"
+        )
+    )
+    display(
+        table(
+            [[c["true_speaker"], c["predicted_speaker"], c["count"]] for c in payload["confusable_speakers"][:8]],
+            ["True speaker", "Predicted as", "Errors"],
+        )
+    )
+    display(
+        Markdown(
+            f"\nHighest-confidence errors (largest score margin) out of "
+            f"{len(payload['errors'])} recorded failures:\n"
+        )
+    )
+    display(
+        table(
+            [
+                [e["sample_id"], e["true_speaker"], e["predicted_speaker"], f"{e['margin']:.3f}"]
+                for e in payload["errors"][:5]
+            ],
+            ["Clip", "True", "Predicted", "Score margin"],
+        )
+    )
+```
+
+<!-- TODO(author): interpret the errors. Are confusions concentrated in
+     same-gender pairs? In speakers with low vocal effort? Do the Wiener
+     artefacts create new failure modes at low SNR? -->
+
+# Discussion
+
+## Why the results occurred
+
+The key evidence is @fig-dsp-effect read together with @fig-ablation. The
+front-end does suppress noise as designed, yet that is not what determines the
+recognition outcome; the distortion it injects into the speech is.
+
+<!-- TODO(author): develop this into prose. Anchor every claim in a number:
+     (a) compare the SNR gain column against the clean-path distortion column
+         for the same arm;
+     (b) note that the gain shrinks and then reverses as input SNR rises, which
+         follows from the a-priori SNR estimate becoming unnecessary once the
+         mixture is already clean;
+     (c) walk the ablation ladder stage by stage and attribute the cost of each
+         stage. The high-pass is essentially free, the low-pass and the notch
+         cost little, and the Wiener stage is responsible for most of the loss;
+     (d) explain why an encoder trained on the noisy data can exploit spectral
+         detail that a fixed filter necessarily discards, and why band limiting
+         therefore removes speaker-discriminative information that carries
+         little energy (see the 4-8 kHz rows of the band table);
+     (e) address the protocol gap in @fig-protocol: the penalty from the DSP
+         chain is roughly half as large on seen speakers as on unseen ones,
+         which suggests the front-end damages transferable speaker information
+         more than it damages speaker-specific cues;
+     (f) reconcile the model-free Fisher table with the accuracy ordering. The
+         front-end raises linear speaker separability in MFCC space while
+         lowering accuracy, so the loss cannot be attributed to information
+         being destroyed outright; say what it can be attributed to and keep
+         the claim within what the measurement supports;
+     (g) read @fig-generalisation for RQ4 and state whether the front-end wins
+         anywhere, including below the training SNR range. -->
+
+## Strengths
+
+<!-- TODO(author): compare against the baselines and against the literature.
+     Note in particular that the cut-offs were derived from measured spectra
+     rather than assumed, that the signal-level characterisation makes the
+     mechanism auditable rather than speculative, that the dual-protocol
+     evaluation separates fitting from generalisation, that the MUSAN
+     recordings are partitioned so learned robustness cannot be memorisation
+     of the test noise, and that the generalisation matrix tests the front-end
+     in the mismatched condition it is actually intended for. -->
+
+## Weaknesses and limitations
+
+<!-- TODO(author): zero-phase filtering is non-causal; a single corpus; additive
+     noise only, no reverberation or channel effects; a single architecture;
+     the noise PSD is estimated from the quietest frames of a 2 s clip, which
+     over-estimates the noise floor when speech is continuous and is the most
+     likely reason the Wiener stage over-suppresses;
+     109 speakers is few for learning a transferable speaker embedding, so the
+     open-set numbers understate what a corpus-scale system would achieve. -->
+
+# Threats to validity
+
+**Internal.** Hyperparameters are tuned only on Pipeline A and then locked, so
+Pipeline B is not tuned in its own favour; conversely Pipeline A may hold a small
+advantage. Noise segment, SNR, crop position, and enrolment partition are
+deterministic functions of the clip identity, so all arms see identical
+difficulty. The MUSAN recordings are partitioned into disjoint train, validation
+and test groups before any segment is cut, which removes the possibility that
+the noise-trained arm scores well by having memorised the specific noise
+waveforms used at test time.
+
+**External.** Results describe VCTK read speech, the MUSAN noise subset, additive
+mixing, and one encoder architecture. They do not transfer automatically to
+reverberant, far-field, multilingual, or spoofed conditions.
+
+**Construct.** Identification accuracy on enrolled unseen speakers and clustering
+agreement measure different aspects of embedding quality; both are reported
+because neither alone is a complete proxy for "speaker information retained".
+
+<!-- TODO(author): state the mitigation for each threat. -->
+
+# Conclusion
+
+<!-- TODO(author): answer RQ1-RQ4 and state the verdict on each hypothesis
+     explicitly. Both H1 and H2 are contradicted by the measurements in
+     @fig-ablation, so say so directly rather than softening it; a rejected
+     hypothesis backed by a measured mechanism is a result, not a failure. -->
+
+# Future work
+
+<!-- TODO(author): causal/streaming variants, learned front-ends, reverberant
+     conditions, cross-corpus evaluation. -->
+
+# Ethics statement
+
+VCTK and MUSAN are public research corpora used under their published licences
+and cited accordingly. No new human data was recorded, so no consent procedure
+was required. The corpora contain identifiable voices; no attempt is made to
+link speakers to real identities, and no raw audio is redistributed with this
+package. Speaker recognition is a biometric technology with surveillance
+potential; this study evaluates robustness only and does not provide an
+identification service.
+
+<!-- TODO(author): confirm licence wording against the corpus licence texts. -->
+
+# Reproducibility
+
+```bash
+uv sync
+# place VCTK 0.80 under dataset/VCTK-Corpus-0.80 and MUSAN under dataset/musan
+uv run python run.py all --config configs/dsp501-v2.json
+uv run pytest -q
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
+```
+
+Seeds, the software environment, and every experiment parameter are recorded in
+`configs/dsp501-v2.json`, `requirements.txt`, and the per-run
+`training-history.json` files.
+
+# Appendix A — Literature matrix
+
+<!-- TODO(author): one row per paper.
+
+| Paper | DSP technique | AI model | Dataset | Key findings | Research gap | Limitations |
+|---|---|---|---|---|---|---|
+-->
+
+# Appendix B — AI declaration
+
+<!-- TODO(author): complete per the assignment template.
+
+| Item | Description |
+|---|---|
+| AI tool | |
+| Purpose | |
+| Stage used | |
+| Human verification | |
+| Final responsibility statement | |
+-->
+
+# References
