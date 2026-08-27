@@ -1,75 +1,60 @@
-% Datasets
 @misc{vctk,
-  author    = {Yamagishi, Junichi and Veaux, Christophe and MacDonald, Kirsten},
-  title     = {{CSTR VCTK Corpus}: {English} Multi-speaker Corpus for {CSTR} Voice Cloning Toolkit},
-  publisher = {University of Edinburgh, The Centre for Speech Technology Research},
-  year      = {2017},
-  note      = {Version 0.80},
-  url       = {https://datashare.ed.ac.uk/handle/10283/2651}
+  author = {Yamagishi, Junichi and Veaux, Christophe and MacDonald, Kirsten},
+  title = {{CSTR VCTK Corpus}: English Multi-speaker Corpus for CSTR Voice Cloning Toolkit},
+  year = {2017}, publisher = {University of Edinburgh, Centre for Speech Technology Research},
+  note = {Version 0.80}, url = {https://datashare.ed.ac.uk/handle/10283/2651}
 }
-
 @misc{musan,
-  author  = {Snyder, David and Chen, Guoguo and Povey, Daniel},
-  title   = {{MUSAN}: A Music, Speech, and Noise Corpus},
-  year    = {2015},
-  note    = {arXiv:1510.08484},
-  url     = {https://www.openslr.org/17/}
+  author = {Snyder, David and Chen, Guoguo and Povey, Daniel},
+  title = {{MUSAN}: A Music, Speech, and Noise Corpus}, year = {2015},
+  eprint = {1510.08484}, archiveprefix = {arXiv}, url = {https://www.openslr.org/17/}
 }
-
-% Speech enhancement
-@article{ephraim1984,
-  author  = {Ephraim, Yariv and Malah, David},
-  title   = {Speech Enhancement Using a Minimum Mean-Square Error Short-Time Spectral Amplitude Estimator},
-  journal = {IEEE Transactions on Acoustics, Speech, and Signal Processing},
-  volume  = {32},
-  number  = {6},
-  pages   = {1109--1121},
-  year    = {1984},
-  doi     = {10.1109/TASSP.1984.1164453}
-}
-
-@article{boll1979,
-  author  = {Boll, Steven},
-  title   = {Suppression of Acoustic Noise in Speech Using Spectral Subtraction},
-  journal = {IEEE Transactions on Acoustics, Speech, and Signal Processing},
-  volume  = {27},
-  number  = {2},
-  pages   = {113--120},
-  year    = {1979},
-  doi     = {10.1109/TASSP.1979.1163209}
-}
-
-% Spectral estimation
 @article{welch1967,
-  author  = {Welch, Peter},
-  title   = {The Use of Fast {Fourier} Transform for the Estimation of Power Spectra: A Method Based on Time Averaging over Short, Modified Periodograms},
-  journal = {IEEE Transactions on Audio and Electroacoustics},
-  volume  = {15},
-  number  = {2},
-  pages   = {70--73},
-  year    = {1967},
-  doi     = {10.1109/TAU.1967.1161901}
+  author={Welch, Peter D.}, title={The Use of Fast Fourier Transform for the Estimation of Power Spectra: A Method Based on Time Averaging over Short, Modified Periodograms},
+  journal={IEEE Transactions on Audio and Electroacoustics}, volume={15}, number={2}, pages={70--73}, year={1967}, doi={10.1109/TAU.1967.1161901}
 }
-
-% Speaker embedding
+@article{ephraim1984,
+  author={Ephraim, Yariv and Malah, David}, title={Speech Enhancement Using a Minimum Mean-Square Error Short-Time Spectral Amplitude Estimator},
+  journal={IEEE Transactions on Acoustics, Speech, and Signal Processing}, volume={32}, number={6}, pages={1109--1121}, year={1984}, doi={10.1109/TASSP.1984.1164453}
+}
 @inproceedings{arcface,
-  author    = {Deng, Jiankang and Guo, Jia and Xue, Niannan and Zafeiriou, Stefanos},
-  title     = {{ArcFace}: Additive Angular Margin Loss for Deep Face Recognition},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  pages     = {4690--4699},
-  year      = {2019},
-  doi       = {10.1109/CVPR.2019.00482}
+  author={Deng, Jiankang and Guo, Jia and Xue, Niannan and Zafeiriou, Stefanos}, title={{ArcFace}: Additive Angular Margin Loss for Deep Face Recognition},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pages={4690--4699}, year={2019}, doi={10.1109/CVPR.2019.00482}
 }
 
-@inproceedings{okabe2018,
-  author    = {Okabe, Koji and Koshinaka, Takafumi and Shinoda, Koichi},
-  title     = {Attentive Statistics Pooling for Deep Speaker Embedding},
-  booktitle = {Proceedings of Interspeech},
-  pages     = {2252--2256},
-  year      = {2018},
-  doi       = {10.21437/Interspeech.2018-993}
+@article{hanifa2021,
+  author={Hanifa, Rafizah Mohd and Isa, Khalid and Mohamad, Shamsul}, title={A Review on Speaker Recognition: Technology and Challenges},
+  journal={Computers and Electrical Engineering}, volume={90}, pages={107005}, year={2021}, doi={10.1016/j.compeleceng.2021.107005}
 }
-
-% TODO(author): add the 8-12 publications from 2021-2026 required by the
-% literature review (at least 3 journal, 3 conference, 2 survey/review).
-% Verify every entry against the real publication; do not cite unread work.
+@article{kabir2021,
+  author={Kabir, Muhammad Mohsin and Mridha, M. F. and Shin, Jungpil and Jahan, Israt and Ohi, Abu Quwsar}, title={A Survey of Speaker Recognition: Fundamental Theories, Recognition Methods and Opportunities},
+  journal={IEEE Access}, volume={9}, pages={79236--79263}, year={2021}, doi={10.1109/ACCESS.2021.3084299}
+}
+@inproceedings{li2021,
+  author={Li, Jianchen and Han, Jiqing and Song, Hongwei}, title={Gradient Regularization for Noise-Robust Speaker Verification},
+  booktitle={Proceedings of Interspeech 2021}, pages={1074--1078}, year={2021}, doi={10.21437/Interspeech.2021-1216}, url={https://www.isca-archive.org/interspeech_2021/li21b_interspeech.html}
+}
+@inproceedings{wang2021,
+  author={Wang, Dan and Dong, Yuanjie and Li, Yaxing and Zi, Yunfei and Zhang, Zhihui and Li, Xiaoqi and Xiong, Shengwu}, title={Variational Information Bottleneck Based Regularization for Speaker Recognition},
+  booktitle={Proceedings of Interspeech 2021}, pages={1054--1058}, year={2021}, doi={10.21437/Interspeech.2021-482}, url={https://www.isca-archive.org/interspeech_2021/wang21j_interspeech.html}
+}
+@article{ferrer2022,
+  author={Ferrer, Luciana and McLaren, Mitchell and Br{"u}mmer, Niko}, title={A Speaker Verification Backend with Robust Performance across Conditions},
+  journal={Computer Speech and Language}, volume={71}, pages={101258}, year={2022}, doi={10.1016/j.csl.2021.101258}
+}
+@article{li2022cnceleb,
+  author={Li, Lantian and Liu, Ruiqi and Kang, Jiawen and Fan, Yue and Cui, Hao and Cai, Yunqi and Vipperla, Ravichander and Zheng, Thomas Fang and Wang, Dong}, title={{CN-Celeb}: Multi-genre Speaker Recognition},
+  journal={Speech Communication}, volume={137}, pages={77--91}, year={2022}, doi={10.1016/j.specom.2022.01.002}
+}
+@inproceedings{mohammadamini2022,
+  author={MohammadAmini, Mohammad and Matrouf, Driss and Bonastre, Jean-Fran{\c{c}}ois and Dowerah, Sandipana and Serizel, Romain and Jouvet, Denis}, title={Learning Noise Robust {ResNet}-Based Speaker Embedding for Speaker Recognition},
+  booktitle={The Speaker and Language Recognition Workshop (Odyssey 2022)}, pages={41--46}, year={2022}, doi={10.21437/Odyssey.2022-6}, url={https://www.isca-archive.org/odyssey_2022/mohammadamini22_odyssey.html}
+}
+@inproceedings{novoselov2023,
+  author={Novoselov, Sergey and Lavrentyeva, Galina and Avdeeva, Anastasia and Volokhov, Vladimir and Khmelev, Nikita and Akulov, Artem and Leonteva, Polina}, title={On the Robustness of wav2vec 2.0 Based Speaker Recognition Systems},
+  booktitle={Proceedings of Interspeech 2023}, pages={3177--3181}, year={2023}, doi={10.21437/Interspeech.2023-881}, url={https://www.isca-archive.org/interspeech_2023/novoselov23_interspeech.html}
+}
+@article{sharma2024,
+  author={Sharma, R. and Govind, D. and Mishra, J. and Dubey, A. K. and Deepak, K. T. and Prasanna, S. R. M.}, title={Milestones in Speaker Recognition},
+  journal={Artificial Intelligence Review}, volume={57}, number={3}, pages={58}, year={2024}, doi={10.1007/s10462-023-10688-w}
+}

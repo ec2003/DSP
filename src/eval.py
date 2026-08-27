@@ -15,7 +15,6 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-from scipy import stats
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import (
     adjusted_rand_score,
@@ -172,7 +171,7 @@ def _purity(truth: np.ndarray, clusters: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Error analysis and significance
+# Error analysis
 # --------------------------------------------------------------------------- #
 def error_cases(
     truth: np.ndarray,
@@ -220,38 +219,3 @@ def confusable_speakers(
         if matrix[i, j] > 0
     ]
 
-
-def paired_significance(
-    baseline: list[float], proposed: list[float]
-) -> dict[str, float]:
-    """Paired t-test, Wilcoxon signed-rank, and a 95% CI on the mean difference."""
-    baseline_array = np.asarray(baseline, dtype=float)
-    proposed_array = np.asarray(proposed, dtype=float)
-    if baseline_array.shape != proposed_array.shape:
-        raise ValueError("paired samples must have equal length")
-
-    difference = proposed_array - baseline_array
-    n = difference.size
-    mean = float(difference.mean())
-    result: dict[str, float] = {"n_pairs": n, "mean_difference": mean}
-
-    if n < 2 or np.allclose(difference, 0.0):
-        return result | {
-            "t_p_value": 1.0,
-            "wilcoxon_p_value": 1.0,
-            "ci_low": mean,
-            "ci_high": mean,
-        }
-
-    standard_error = float(difference.std(ddof=1) / np.sqrt(n))
-    half_width = stats.t.ppf(0.975, n - 1) * standard_error
-    result["ci_low"] = mean - half_width
-    result["ci_high"] = mean + half_width
-    result["t_p_value"] = float(stats.ttest_rel(proposed_array, baseline_array).pvalue)
-    try:
-        result["wilcoxon_p_value"] = float(
-            stats.wilcoxon(proposed_array, baseline_array).pvalue
-        )
-    except ValueError:
-        result["wilcoxon_p_value"] = 1.0
-    return result

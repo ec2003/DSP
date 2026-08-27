@@ -1,413 +1,199 @@
-"""Study orchestration: hyperparameter tuning, training, evaluation, analysis."""
+"""Orchestration and speaker-clustered inference for one frozen robust CNN."""
 
 from __future__ import annotations
 
+import csv
 import json
+from collections import defaultdict
 from dataclasses import asdict
 
 import numpy as np
 import torch
 
-from src.config import ExperimentConfig
-from src.eval import (
-    classification_metrics,
-    clustering_metrics,
-    confusable_speakers,
-    enrollment_split,
-    error_cases,
-    extract_embeddings,
-    nearest_centroid_predict,
-    paired_significance,
-    speaker_labels,
-    svm_predict,
-)
-from src.features import handcrafted_features
-from src.train import (
-    TrainResult,
-    load_encoder,
-    prepared_split,
-    resolve_device,
-    train_condition,
-)
-
-#: Grid searched once on Pipeline A, then locked for every condition and seed.
-TUNING_GRID = (
-    {"learning_rate": 1e-3, "batch_size": 64},
-    {"learning_rate": 3e-4, "batch_size": 64},
-    {"learning_rate": 1e-3, "batch_size": 32},
-)
-TUNING_EPOCHS = 8
+from src.config import FACTORIAL_CELLS, ExperimentConfig
+from src.corpus import load_clips, load_manifest
+from src.eval import classification_metrics, clustering_metrics, confusable_speakers, enrollment_split, error_cases, extract_embeddings, nearest_centroid_predict, speaker_labels
+from src.features import residual_snr_db
+from src.pipeline import process_split
+from src.train import TrainResult, load_encoder, resolve_device, train_robust_cnn
 
 
-def _tuning_path(config: ExperimentConfig):
-    return config.study_root / "tuning.json"
-
-
-def locked_hyperparameters(config: ExperimentConfig) -> dict[str, float | int]:
-    path = _tuning_path(config)
-    if not path.is_file():
-        return {"learning_rate": config.learning_rate, "batch_size": config.batch_size}
-    return json.loads(path.read_text(encoding="utf-8"))["selected"]
-
-
-def tune_hyperparameters(
-    config: ExperimentConfig, *, workers: int = 8
-) -> dict[str, object]:
-    """Grid-search on the Pipeline A baseline with the first seed only."""
-    seed = config.seeds[0]
-    trials = []
-    for candidate in TUNING_GRID:
-        result = train_condition(
-            config,
-            "A_raw_noisy",
-            seed,
-            workers=workers,
-            overrides={**candidate, "epochs": TUNING_EPOCHS},
-        )
-        trials.append(
-            {**candidate, "validation_accuracy": result.best_validation_accuracy}
-        )
-        print(
-            f"  lr={candidate['learning_rate']} bs={candidate['batch_size']} "
-            f"-> val-acc {result.best_validation_accuracy:.4f}"
-        )
-
-    best = max(trials, key=lambda trial: trial["validation_accuracy"])
-    payload = {
-        "tuned_on": {"condition": "A_raw_noisy", "seed": seed, "epochs": TUNING_EPOCHS},
-        "grid": list(TUNING_GRID),
-        "trials": trials,
-        "selected": {
-            "learning_rate": best["learning_rate"],
-            "batch_size": best["batch_size"],
-        },
-        "optimizer": config.optimizer,
-        "weight_decay": config.weight_decay,
-        "epochs": config.epochs,
-    }
-    _tuning_path(config).write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-    )
-    return payload
-
-
-def _planned_runs(config: ExperimentConfig, only: str | None) -> list[tuple[str, int]]:
-    """Primary arms run on every seed; ablation arms run on the first seed only."""
-    if only is not None:
-        return [(only, seed) for seed in config.seeds]
-    runs = []
-    for condition in config.conditions:
-        seeds = (
-            config.seeds
-            if condition.name in config.primary_conditions
-            else config.seeds[:1]
-        )
-        runs.extend((condition.name, seed) for seed in seeds)
-    return runs
-
-
-def train_study(
-    config: ExperimentConfig, *, workers: int = 8, only: str | None = None
-) -> list[TrainResult]:
-    overrides = locked_hyperparameters(config)
-    results = []
-    for condition_name, seed in _planned_runs(config, only):
-        results.append(
-            train_condition(
-                config, condition_name, seed, workers=workers, overrides=overrides
-            )
-        )
-    (config.study_root / "training-summary.json").write_text(
-        json.dumps([asdict(result) for result in results], indent=2) + "\n",
-        encoding="utf-8",
-    )
+def train_study(config: ExperimentConfig, *, workers: int = 0, only: str | None = None, missing_only: bool = False) -> list[TrainResult]:
+    if only is not None and only != "robust_cnn":
+        raise ValueError("there is one training recipe only: robust_cnn")
+    seeds = [seed for seed in config.seeds if not missing_only or not (config.seed_dir(seed) / "encoder.pt").is_file()]
+    results = [train_robust_cnn(config, seed, workers=workers) for seed in seeds]
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    summary = [asdict(result) for result in results]
+    (config.run_dir / "training-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return results
 
 
-# --------------------------------------------------------------------------- #
-# Evaluation
-# --------------------------------------------------------------------------- #
-def _evaluate_embeddings(
-    embeddings: np.ndarray, records, config: ExperimentConfig, seed: int
-) -> dict[str, object]:
+def _evaluation_report(embeddings: np.ndarray, records, processed, config: ExperimentConfig, seed: int) -> dict[str, object]:
     labels, names = speaker_labels(records)
     enrol, query = enrollment_split(records, config.enrollment_clips)
-    truth, prediction, scores = nearest_centroid_predict(
-        embeddings, labels, enrol, query
-    )
-    svm_truth, svm_prediction = svm_predict(embeddings, labels, enrol, query, seed)
-
-    return {
-        "n_speakers": len(names),
-        "speakers": names,
+    truth, prediction, scores = nearest_centroid_predict(embeddings, labels, enrol, query)
+    base = {
+        "n_speakers": len(names), "speakers": names,
         "nearest_centroid": classification_metrics(truth, prediction),
-        "svm": classification_metrics(svm_truth, svm_prediction),
         "clustering": clustering_metrics(embeddings, labels, config.cluster_min_size),
         "errors": error_cases(truth, prediction, scores, query, records, names),
         "confusable_speakers": confusable_speakers(truth, prediction, names),
     }
-
-
-def _mfcc_reference(
-    waveforms: np.ndarray, records, config: ExperimentConfig, seed: int
-) -> dict[str, object]:
-    """Classical DSP-only baseline: handcrafted features, no learned encoder."""
-    features = np.stack(
-        [handcrafted_features(w, config.sample_rate) for w in waveforms]
-    )
-    features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-8)
-    normalised = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-12)
-    return _evaluate_embeddings(normalised.astype(np.float32), records, config, seed)
-
-
-def evaluate_study(
-    config: ExperimentConfig, *, workers: int = 8, only: str | None = None
-) -> None:
-    device = resolve_device()
-    for condition_name, seed in _planned_runs(config, only):
-        run_root = config.run_root(seed, condition_name)
-        checkpoint = run_root / "encoder.pt"
-        if not checkpoint.is_file():
-            print(f"  skip {condition_name} seed {seed}: no checkpoint")
-            continue
-        model = load_encoder(config, checkpoint, device)
-        condition = config.condition(condition_name)
-
-        # Clean-trained models are evaluated on clean test audio only; noisy arms
-        # sweep the test SNR grid.
-        snr_grid = (None,) if not condition.add_noise else config.test_snr_db
-        for snr_db in snr_grid:
-            tag = "clean" if snr_db is None else f"snr-{int(snr_db)}"
-
-            # `test` holds speakers never seen in training (open set); `seen_test`
-            # holds unseen utterances of the training speakers (closed set). The
-            # enrolment protocol is identical, so the gap between them isolates
-            # how much of the score comes from speaker-specific fitting.
-            for split, protocol in (("test", "unseen"), ("seen_test", "seen")):
-                if split == "seen_test" and not config.closed_set_clips:
-                    continue
-                waveforms, records = prepared_split(
-                    config, split, condition_name, seed, snr_db=snr_db, workers=workers
-                )
-                embeddings = extract_embeddings(model, waveforms, device)
-                report = {
-                    "condition": condition_name,
-                    "seed": seed,
-                    "test_snr_db": snr_db,
-                    "protocol": protocol,
-                    "stages": list(condition.stages),
-                    **_evaluate_embeddings(embeddings, records, config, seed),
-                }
-                suffix = "" if protocol == "unseen" else "-seen"
-                (run_root / f"evaluation-{tag}{suffix}.json").write_text(
-                    json.dumps(report, indent=2) + "\n", encoding="utf-8"
-                )
-                accuracy = report["nearest_centroid"]["accuracy"]
-                print(
-                    f"  {condition_name:<18} seed {seed} {tag:<8} {protocol:<6} "
-                    f"acc {accuracy:.4f}",
-                    flush=True,
-                )
-
-                if protocol != "unseen":
-                    continue
-
-                # Kept for the embedding-geometry figure; only the arms the report
-                # contrasts directly, to bound artifact size.
-                if condition_name in config.primary_conditions and snr_db in (
-                    None,
-                    config.test_snr_db[0],
-                ):
-                    np.save(run_root / f"embeddings-{tag}.npy", embeddings)
-
-                # The DSP-only reference uses the same audio, so it is only computed
-                # for the two pipelines being contrasted.
-                if condition_name in ("A_raw_noisy", "B_full"):
-                    reference = {
-                        "condition": condition_name,
-                        "seed": seed,
-                        "test_snr_db": snr_db,
-                        "protocol": protocol,
-                        "stages": list(condition.stages),
-                        **_mfcc_reference(waveforms, records, config, seed),
-                    }
-                    (run_root / f"evaluation-{tag}-dsponly.json").write_text(
-                        json.dumps(reference, indent=2) + "\n", encoding="utf-8"
-                    )
-        del model
-        torch.cuda.empty_cache()
-
-
-# --------------------------------------------------------------------------- #
-# Generalisation matrix
-# --------------------------------------------------------------------------- #
-def cross_evaluate_study(
-    config: ExperimentConfig, *, workers: int = 8
-) -> list[dict[str, object]]:
-    """Evaluate every encoder against every front-end, over an extended SNR grid.
-
-    The main evaluation is matched: an encoder is only ever shown audio produced
-    by its own front-end, and the SNR range is the one it trained on. That hides
-    the case a front-end is actually for. Here the encoder and the front-end are
-    varied independently, and the grid extends below the training SNR range, so
-    the results show when a front-end earns its cost at inference time.
-
-    A front-end that adds no noise has no SNR axis and is evaluated once; that
-    cell measures what training on noise costs on clean audio.
-    """
-    device = resolve_device()
-    rows: list[dict[str, object]] = []
-
-    for encoder_condition in config.cross_eval_encoders:
-        trained_on_noise = config.condition(encoder_condition).add_noise
-        for seed in config.seeds:
-            checkpoint = config.run_root(seed, encoder_condition) / "encoder.pt"
-            if not checkpoint.is_file():
-                print(f"  skip encoder {encoder_condition} seed {seed}: no checkpoint")
-                continue
-            model = load_encoder(config, checkpoint, device)
-
-            for frontend in config.cross_eval_frontends:
-                frontend_adds_noise = config.condition(frontend).add_noise
-                grid = config.cross_eval_snr_db if frontend_adds_noise else (None,)
-                for snr_db in grid:
-                    waveforms, records = prepared_split(
-                        config, "test", frontend, seed, snr_db=snr_db, workers=workers
-                    )
-                    embeddings = extract_embeddings(model, waveforms, device)
-                    labels, names = speaker_labels(records)
-                    enrol, query = enrollment_split(records, config.enrollment_clips)
-                    truth, prediction, _ = nearest_centroid_predict(
-                        embeddings, labels, enrol, query
-                    )
-                    metrics = classification_metrics(truth, prediction)
-                    rows.append(
-                        {
-                            "encoder": encoder_condition,
-                            "encoder_trained_on_noise": trained_on_noise,
-                            "frontend": frontend,
-                            "frontend_stages": "+".join(
-                                config.condition(frontend).stages
-                            )
-                            or "none",
-                            "seed": seed,
-                            "test_snr_db": None if snr_db is None else float(snr_db),
-                            "within_training_snr": snr_db is not None
-                            and float(snr_db) in config.train_snr_db,
-                            "accuracy": metrics["accuracy"],
-                            "f1_macro": metrics["f1_macro"],
-                            "n_speakers": len(names),
-                        }
-                    )
-                    level = "clean" if snr_db is None else f"{snr_db:>5.0f} dB"
-                    print(
-                        f"  encoder {encoder_condition:<12} frontend {frontend:<12} "
-                        f"seed {seed} {level:>8}  acc {metrics['accuracy']:.4f}",
-                        flush=True,
-                    )
-            del model
-            torch.cuda.empty_cache()
-
-    config.report_root.mkdir(parents=True, exist_ok=True)
-    (config.report_root / "cross-eval.json").write_text(
-        json.dumps(rows, indent=2) + "\n", encoding="utf-8"
-    )
-    if rows:
-        fieldnames = list(rows[0].keys())
-        lines = [",".join(fieldnames)]
-        lines += [",".join(str(row[key]) for key in fieldnames) for row in rows]
-        (config.report_root / "cross-eval.csv").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
-    return rows
-
-
-# --------------------------------------------------------------------------- #
-# Analysis
-# --------------------------------------------------------------------------- #
-def collect_metrics(config: ExperimentConfig) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for report_path in sorted(config.study_root.glob("seed-*/*/evaluation-*.json")):
-        payload = json.loads(report_path.read_text(encoding="utf-8"))
-        if "condition" not in payload:
-            continue
-        rows.append(
-            {
-                "condition": payload["condition"],
-                "seed": payload["seed"],
-                "test_snr_db": payload["test_snr_db"],
-                "protocol": payload.get("protocol", "unseen"),
-                "model": "dsp_only" if report_path.stem.endswith("dsponly") else "cnn",
-                "accuracy": payload["nearest_centroid"]["accuracy"],
-                "precision_macro": payload["nearest_centroid"]["precision_macro"],
-                "recall_macro": payload["nearest_centroid"]["recall_macro"],
-                "f1_macro": payload["nearest_centroid"]["f1_macro"],
-                "svm_accuracy": payload["svm"]["accuracy"],
-                "svm_f1_macro": payload["svm"]["f1_macro"],
-                "agglomerative_ari": payload["clustering"]["agglomerative_ari"],
-                "agglomerative_nmi": payload["clustering"]["agglomerative_nmi"],
-                "hdbscan_ari": payload["clustering"]["hdbscan_ari"],
-                "hdbscan_outlier_rate": payload["clustering"]["hdbscan_outlier_rate"],
-            }
-        )
-    return rows
-
-
-def _significance_table(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Paired tests of Pipeline B against Pipeline A, matched on seed and SNR."""
-    results = []
-    for protocol in sorted({row["protocol"] for row in rows}):
-        indexed = {
-            (row["condition"], row["seed"], row["test_snr_db"]): row
-            for row in rows
-            if row["model"] == "cnn" and row["protocol"] == protocol
+    queries, grouped = [], defaultdict(list)
+    for position, (actual, predicted, clip_index) in enumerate(zip(truth, prediction, query, strict=True)):
+        record, mix = records[int(clip_index)], processed.mixing[int(clip_index)]
+        item = {
+            "sample_id": record.sample_id, "speaker_id": record.speaker_id,
+            "true_speaker": names[int(actual)], "predicted_speaker": names[int(predicted)],
+            "correct": bool(actual == predicted), "score": float(scores[position].max()),
+            "mix": mix,
+            "waveform_snr_db": None if mix["family"] == "clean" else residual_snr_db(processed.clean_components[int(clip_index)], processed.waveforms[int(clip_index)]),
         }
-        for metric in ("accuracy", "f1_macro", "agglomerative_ari"):
-            baseline, proposed = [], []
-            for (condition, seed, snr), row in indexed.items():
-                if condition != "A_raw_noisy":
-                    continue
-                partner = indexed.get(("B_full", seed, snr))
-                if partner is not None:
-                    baseline.append(row[metric])
-                    proposed.append(partner[metric])
-            if baseline:
-                results.append(
-                    {
-                        "metric": metric,
-                        "protocol": protocol,
-                        "comparison": "B_full - A_raw_noisy",
-                        **paired_significance(baseline, proposed),
-                    }
-                )
-    return results
+        queries.append(item); grouped[record.speaker_id].append(item)
+    base["query_predictions"] = queries
+    base["per_speaker"] = [
+        {"speaker_id": speaker, "n_queries": len(items), "accuracy": float(np.mean([x["correct"] for x in items])), "mean_waveform_snr_db": None if items[0]["waveform_snr_db"] is None else float(np.mean([x["waveform_snr_db"] for x in items]))}
+        for speaker, items in sorted(grouped.items())
+    ]
+    return base
 
 
-def analyze_study(config: ExperimentConfig) -> dict[str, object]:
+def evaluate_study(config: ExperimentConfig, *, workers: int = 0, only: str | None = None, cells: tuple[str, ...] | None = None) -> list[str]:
+    if only is not None and only not in FACTORIAL_CELLS:
+        raise ValueError(f"unknown factorial cell {only!r}")
+    if only is not None and cells is not None:
+        raise ValueError("pass either `only` or `cells`, not both")
+    selected = (only,) if only else (cells if cells is not None else FACTORIAL_CELLS)
+    if not selected or set(selected) - set(FACTORIAL_CELLS):
+        raise ValueError("evaluation cells must be non-empty factorial cells")
+    device = resolve_device()
+    conditions = tuple(config.condition(name) for name in selected)
+    written: list[str] = []
+    for seed in config.seeds:
+        root = config.seed_dir(seed); checkpoint = root / "encoder.pt"
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Missing robust_cnn checkpoint for seed {seed}: {checkpoint}")
+        model = load_encoder(config, checkpoint, device)
+        for split, protocol in (("test", "unseen"), ("seen_test", "seen")):
+            if split == "seen_test" and not config.closed_set_clips:
+                continue
+            clips, records = load_clips(config.cache_root, split), load_manifest(config.cache_root, split)
+            for family, snr in [(None, None), *((family, snr) for family in config.test_noise_families for snr in config.test_snr_db)]:
+                label = "clean" if family is None else f"{family}-snr-{snr:g}"
+                for condition in conditions:
+                    processed = process_split(clips, records, condition, config, seed=seed, family=family, snr_db=snr)
+                    embeddings = extract_embeddings(model, processed.waveforms, device)
+                    report = {"recipe": "robust_cnn", "seed": seed, "cell": condition.name, "stages": list(condition.stages), "protocol": protocol, "audio_domain": "clean" if family is None else "noisy", "noise_family": family, "test_snr_db": snr, **_evaluation_report(embeddings, records, processed, config, seed)}
+                    suffix = "" if protocol == "unseen" else "-seen"
+                    output = root / f"evaluation-{label}-{condition.name}{suffix}.json"
+                    output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                    written.append(str(output))
+                    print(f"  seed {seed} {protocol:<6} {label:<17} {condition.name:<16} acc {report['nearest_centroid']['accuracy']:.4f}", flush=True)
+        del model; torch.cuda.empty_cache()
+    return written
+
+
+def collect_metrics(config: ExperimentConfig) -> list[dict[str, object]]:
+    rows = []
+    for path in sorted(config.run_dir.glob("seed-*/robust_cnn/evaluation-*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        score, cluster = payload["nearest_centroid"], payload["clustering"]
+        rows.append({"seed": payload["seed"], "cell": payload["cell"], "protocol": payload["protocol"], "audio_domain": payload["audio_domain"], "noise_family": payload["noise_family"], "test_snr_db": payload["test_snr_db"], "accuracy": score["accuracy"], "f1_macro": score["f1_macro"], "agglomerative_ari": cluster["agglomerative_ari"], "agglomerative_nmi": cluster["agglomerative_nmi"], "path": str(path)})
+    return rows
+
+
+def evaluation_summary(config: ExperimentConfig, cells: tuple[str, ...], label: str) -> dict[str, object]:
+    """Persist a compact phase-local table plus representative error samples."""
+    rows = [row for row in collect_metrics(config) if row["cell"] in cells]
+    config.report_root.mkdir(parents=True, exist_ok=True)
+    table_path = config.report_root / f"{label}-metric-summary.csv"
+    if rows:
+        with table_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    errors = []
+    for path in sorted(config.run_dir.glob("seed-*/robust_cnn/evaluation-*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload["cell"] not in cells:
+            continue
+        errors.extend({"report": str(path), **item} for item in payload["query_predictions"] if not item["correct"])
+    error_path = config.report_root / f"{label}-error-samples.json"
+    error_path.write_text(json.dumps(errors[:100], indent=2) + "\n", encoding="utf-8")
+    return {"rows": rows, "table_path": str(table_path), "error_samples": errors[:20], "error_path": str(error_path)}
+
+
+def paired_cluster_bootstrap(observations: list[dict[str, object]], *, replicates: int, seed: int) -> dict[str, object]:
+    """Resample speakers; a draw retains every seed/SNR/family/query for that speaker."""
+    by_speaker: dict[str, list[float]] = defaultdict(list)
+    for row in observations:
+        by_speaker[str(row["speaker_id"])].append(float(row["delta"]))
+    speakers = sorted(by_speaker)
+    if not speakers:
+        raise ValueError("no paired speaker observations")
+    point = float(np.mean([value for values in by_speaker.values() for value in values]))
+    rng = np.random.default_rng(seed)
+    draws = np.empty(replicates)
+    for i in range(replicates):
+        sampled = rng.choice(speakers, size=len(speakers), replace=True)
+        draws[i] = np.mean([value for speaker in sampled for value in by_speaker[speaker]])
+    return {"n_speakers": len(speakers), "n_paired_speaker_strata": len(observations), "mean_delta": point, "ci_low": float(np.quantile(draws, .025)), "ci_high": float(np.quantile(draws, .975)), "bootstrap_replicates": replicates, "resampling_unit": "test speaker; all seed, SNR, family, and query observations retained"}
+
+
+def _factorial_observations(config: ExperimentConfig, metric: str, protocol: str) -> dict[str, list[dict[str, object]]]:
+    reports = {}
+    for path in config.run_dir.glob("seed-*/robust_cnn/evaluation-*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload["protocol"] != protocol:
+            continue
+        key = (payload["seed"], payload["audio_domain"], payload["noise_family"], payload["test_snr_db"])
+        reports.setdefault(key, {})[payload["cell"]] = payload
+    effects = {"bandpass_main": [], "wiener_main": [], "bandpass_x_wiener": [], **{f"{cell}_minus_raw": [] for cell in FACTORIAL_CELLS if cell != "raw"}}
+    for context, cells in reports.items():
+        if set(cells) != set(FACTORIAL_CELLS):
+            continue
+        speakers = {row["speaker_id"] for cell in cells.values() for row in cell["per_speaker"]}
+        indexed = {cell: {row["speaker_id"]: row for row in payload["per_speaker"]} for cell, payload in cells.items()}
+        for speaker in speakers:
+            if not all(speaker in indexed[cell] for cell in FACTORIAL_CELLS):
+                continue
+            values = {cell: float(indexed[cell][speaker][metric]) for cell in FACTORIAL_CELLS}
+            common = {"speaker_id": speaker, "seed": context[0], "audio_domain": context[1], "noise_family": context[2], "test_snr_db": context[3]}
+            effects["bandpass_main"].append(common | {"delta": ((values["bandpass"] - values["raw"]) + (values["bandpass_wiener"] - values["wiener"])) / 2})
+            effects["wiener_main"].append(common | {"delta": ((values["wiener"] - values["raw"]) + (values["bandpass_wiener"] - values["bandpass"])) / 2})
+            effects["bandpass_x_wiener"].append(common | {"delta": values["bandpass_wiener"] - values["bandpass"] - values["wiener"] + values["raw"]})
+            for cell in ("bandpass", "wiener", "bandpass_wiener"):
+                effects[f"{cell}_minus_raw"].append(common | {"delta": values[cell] - values["raw"]})
+    return effects
+
+
+def statistical_analysis(config: ExperimentConfig) -> dict[str, object]:
+    rows = collect_metrics(config)
+    if not rows:
+        raise FileNotFoundError("No evaluation reports found; run raw and DSP evaluation phases first.")
+    config.report_root.mkdir(parents=True, exist_ok=True)
+    with (config.report_root / "metric-summary.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    factorial = {}
+    for protocol in sorted({str(row["protocol"]) for row in rows}):
+        factorial[protocol] = {}
+        for metric in ("accuracy",):
+            factorial[protocol][metric] = {name: paired_cluster_bootstrap(items, replicates=config.bootstrap_replicates, seed=config.seeds[0]) for name, items in _factorial_observations(config, metric, protocol).items() if items}
+    (config.report_root / "factorial-bootstrap.json").write_text(json.dumps(factorial, indent=2) + "\n", encoding="utf-8")
+    return {"rows": rows, "factorial": factorial}
+
+
+def render_figures(config: ExperimentConfig) -> dict[str, object]:
     from src import plots
 
     rows = collect_metrics(config)
     if not rows:
-        raise FileNotFoundError(
-            "No evaluation reports found; run `run.py evaluate` first."
-        )
-
-    config.report_root.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    csv_lines = [",".join(fieldnames)]
-    csv_lines += [
-        ",".join("" if row[key] is None else str(row[key]) for key in fieldnames)
-        for row in rows
-    ]
-    (config.report_root / "metric-summary.csv").write_text(
-        "\n".join(csv_lines) + "\n", encoding="utf-8"
-    )
-
-    significance = _significance_table(rows)
-    (config.report_root / "significance.json").write_text(
-        json.dumps(significance, indent=2) + "\n", encoding="utf-8"
-    )
-
+        raise FileNotFoundError("No evaluation reports found; cannot render figures.")
     plots.render_all(config, rows)
-    print(f"  wrote {len(rows)} metric rows and {len(significance)} significance tests")
-    return {"rows": rows, "significance": significance}
+    return {"figures": [str(path) for path in sorted(config.report_root.glob("*.png"))], "metric_rows": len(rows)}
+
+
+def analyze_study(config: ExperimentConfig) -> dict[str, object]:
+    """Compatibility convenience that runs statistics then rendering."""
+    result = statistical_analysis(config)
+    result.update(render_figures(config))
+    return result

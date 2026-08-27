@@ -1,85 +1,65 @@
-"""Versioned experiment configuration.
-
-Every numeric knob that affects a result lives in the JSON config so a run can
-be reproduced from the config file plus the seed alone.
-"""
+"""Configuration for one immutable frozen-CNN DSP factorial experiment."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 
-#: DSP stage names that :func:`src.pipeline.build_chain` knows how to build.
-KNOWN_STAGES = frozenset(
-    {"highpass", "lowpass", "telephone", "notch", "wiener", "specsub"}
-)
+KNOWN_STAGES = frozenset({"bandpass", "wiener", "notch"})
+FACTORIAL_CELLS = ("raw", "bandpass", "wiener", "bandpass_wiener")
+MUSAN_FAMILIES = ("noise", "music", "speech", "babble")
 
 
 @dataclass(frozen=True)
 class Condition:
-    """One experimental arm: whether noise is added, and which DSP stages run."""
+    """An inference-time front-end cell; it never chooses a training recipe."""
 
     name: str
-    add_noise: bool
     stages: tuple[str, ...]
 
     def __post_init__(self) -> None:
         unknown = set(self.stages) - KNOWN_STAGES
         if unknown:
-            raise ValueError(
-                f"condition {self.name!r} has unknown stages: {sorted(unknown)}"
-            )
+            raise ValueError(f"condition {self.name!r} has unknown stages: {sorted(unknown)}")
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     study_id: str
-    config_version: int
-
     vctk_root: str
     musan_root: str
     output_root: str
-
     sample_rate: int
     segment_seconds: float
     clips_per_speaker: int
     eval_clips_per_speaker: int
     train_speakers: int
     validation_speakers: int
-
     seeds: tuple[int, ...]
     conditions: tuple[Condition, ...]
-    primary_conditions: tuple[str, ...]
-    train_snr_db: tuple[float, ...]
+    train_snr_range_db: tuple[float, float]
     test_snr_db: tuple[float, ...]
-
-    # MUSAN recordings are partitioned train/validation/test before any segment
-    # is cut, so an encoder is never tested on a noise waveform it trained on.
     noise_pool_size: int
     noise_split_fractions: tuple[float, ...]
-
-    # Generalisation matrix: which encoders to reuse, which front-end to feed
-    # them, and an SNR grid that extends below the training range.
-    cross_eval_encoders: tuple[str, ...]
-    cross_eval_frontends: tuple[str, ...]
-    cross_eval_snr_db: tuple[float, ...]
-
+    p_noise: float
+    train_noise_families: tuple[str, ...]
+    test_noise_families: tuple[str, ...]
+    babble_sources_range: tuple[int, int]
+    band_speech_energy_margin: float
+    bandpass_order: int
     n_fft: int
     hop_length: int
     n_mels: int
-    highpass_hz: float
-    lowpass_hz: float
-    telephone_band_hz: tuple[float, float]
+    notch_enabled: bool
     notch_max_peaks: int
     notch_prominence_db: float
     notch_quality: float
     wiener_noise_quantile: float
     wiener_alpha: float
     wiener_gain_floor_db: float
-    specsub_over_subtraction: float
-    specsub_spectral_floor: float
-
+    positive_control_snr_db: tuple[float, ...]
     embedding_dim: int
     cnn_channels: tuple[int, ...]
     arcface_margin: float
@@ -89,96 +69,121 @@ class ExperimentConfig:
     epochs: int
     weight_decay: float
     optimizer: str
-
     enrollment_clips: int
     closed_set_clips: int
     cluster_min_size: int
+    bootstrap_replicates: int
+    # Bound by the orchestration API; deliberately absent from config.json.
+    run_id: int | None = None
 
     def __post_init__(self) -> None:
-        if self.sample_rate <= 0:
-            raise ValueError(f"sample_rate must be positive, got {self.sample_rate}")
-        nyquist = self.sample_rate / 2
-        if not 0 < self.highpass_hz < self.lowpass_hz < nyquist:
-            raise ValueError(
-                f"require 0 < highpass ({self.highpass_hz}) < lowpass "
-                f"({self.lowpass_hz}) < Nyquist ({nyquist})"
-            )
+        if self.sample_rate <= 0 or self.segment_seconds <= 0:
+            raise ValueError("sample_rate and segment_seconds must be positive")
+        if not 0 <= self.p_noise <= 1:
+            raise ValueError("p_noise must lie in [0, 1]")
+        lo, hi = self.train_snr_range_db
+        if lo < 0 or hi < lo:
+            raise ValueError("train_snr_range_db must be increasing and non-negative")
+        names = tuple(condition.name for condition in self.conditions)
+        if names != FACTORIAL_CELLS:
+            raise ValueError(f"conditions must be exactly {FACTORIAL_CELLS}, got {names}")
+        if len(self.noise_split_fractions) != 3 or min(self.noise_split_fractions) <= 0 or abs(sum(self.noise_split_fractions) - 1) > 1e-6:
+            raise ValueError("noise_split_fractions must be three positive values summing to 1")
+        if not set(self.train_noise_families) <= set(MUSAN_FAMILIES) or not set(self.test_noise_families) <= set(MUSAN_FAMILIES):
+            raise ValueError(f"noise families must be drawn from {MUSAN_FAMILIES}")
+        if not self.train_noise_families or not self.test_noise_families:
+            raise ValueError("at least one train and test noise family is required")
+        if not 3 <= self.babble_sources_range[0] <= self.babble_sources_range[1] <= 7:
+            raise ValueError("babble_sources_range must lie in [3, 7]")
+        if not 0 < self.band_speech_energy_margin < 0.5:
+            raise ValueError("band_speech_energy_margin must lie in (0, .5)")
+        if self.bandpass_order < 1:
+            raise ValueError("bandpass_order must be positive")
         if self.enrollment_clips >= self.eval_clips_per_speaker:
-            raise ValueError(
-                f"enrollment_clips ({self.enrollment_clips}) must be smaller than "
-                f"eval_clips_per_speaker ({self.eval_clips_per_speaker})"
-            )
+            raise ValueError("enrollment_clips must be smaller than eval_clips_per_speaker")
         if self.closed_set_clips and self.enrollment_clips >= self.closed_set_clips:
-            raise ValueError(
-                f"enrollment_clips ({self.enrollment_clips}) must be smaller than "
-                f"closed_set_clips ({self.closed_set_clips})"
-            )
-        known = {condition.name for condition in self.conditions}
-        missing = set(self.primary_conditions) - known
-        if missing:
-            raise ValueError(f"primary_conditions not defined: {sorted(missing)}")
-        if len(self.noise_split_fractions) != 3:
-            raise ValueError(
-                "noise_split_fractions needs three entries (train, validation, "
-                f"test), got {self.noise_split_fractions}"
-            )
-        if (
-            min(self.noise_split_fractions) <= 0
-            or abs(sum(self.noise_split_fractions) - 1.0) > 1e-6
-        ):
-            raise ValueError(
-                f"noise_split_fractions must be positive and sum to 1, got "
-                f"{self.noise_split_fractions}"
-            )
-        unknown = (
-            set(self.cross_eval_encoders) | set(self.cross_eval_frontends)
-        ) - known
-        if unknown:
-            raise ValueError(
-                f"cross-eval refers to undefined conditions: {sorted(unknown)}"
-            )
+            raise ValueError("enrollment_clips must be smaller than closed_set_clips")
+        if self.bootstrap_replicates < 100:
+            raise ValueError("bootstrap_replicates must be at least 100")
 
-    # -- derived paths ----------------------------------------------------- #
     @property
     def study_root(self) -> Path:
         return Path(self.output_root) / self.study_id
 
     @property
     def cache_root(self) -> Path:
-        return self.study_root / "cache"
+        return self.study_root / "cache" / self.data_cache_hash
+
+    @property
+    def data_cache_hash(self) -> str:
+        """Stable identity for artifacts materialised by the prepare stage."""
+        payload = asdict(self)
+        keys = (
+            "vctk_root", "musan_root", "sample_rate",
+            "segment_seconds", "clips_per_speaker", "eval_clips_per_speaker",
+            "train_speakers", "validation_speakers", "seeds", "noise_pool_size",
+            "noise_split_fractions", "closed_set_clips",
+        )
+        return sha256(json.dumps({key: payload[key] for key in keys}, sort_keys=True, default=list).encode()).hexdigest()[:16]
+
+    @property
+    def config_hash(self) -> str:
+        """Identity for an experiment design, excluding its destination/run."""
+        payload = asdict(self)
+        payload.pop("output_root", None)
+        payload.pop("run_id", None)
+        return sha256(json.dumps(payload, sort_keys=True, default=list).encode()).hexdigest()
+
+    @property
+    def run_tag(self) -> str:
+        if self.run_id is None:
+            raise RuntimeError("configuration is not bound to an experiment run")
+        return f"run-{self.run_id}"
+
+    @property
+    def run_dir(self) -> Path:
+        return self.study_root / "runs" / self.run_tag
 
     @property
     def report_root(self) -> Path:
-        return self.study_root / "reports"
+        return self.run_dir / "reports"
+
+    @property
+    def dsp_design_path(self) -> Path:
+        return self.run_dir / "dsp-design.json"
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.run_dir / "run-manifest.json"
 
     @property
     def segment_samples(self) -> int:
         return round(self.sample_rate * self.segment_seconds)
 
-    def run_root(self, seed: int, condition: str) -> Path:
-        return self.study_root / f"seed-{seed}" / condition
+    @property
+    def config_snapshot_path(self) -> Path:
+        return self.run_dir / "config.json"
+
+    def seed_dir(self, seed: int) -> Path:
+        return self.run_dir / f"seed-{seed}" / "robust_cnn"
 
     def condition(self, name: str) -> Condition:
-        for candidate in self.conditions:
-            if candidate.name == name:
-                return candidate
+        for condition in self.conditions:
+            if condition.name == name:
+                return condition
         raise KeyError(f"unknown condition {name!r}")
 
 
-def load_config(path: Path) -> ExperimentConfig:
+def load_config(path: Path | str) -> ExperimentConfig:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    payload["seeds"] = tuple(payload["seeds"])
-    payload["primary_conditions"] = tuple(payload["primary_conditions"])
-    payload["train_snr_db"] = tuple(payload["train_snr_db"])
-    payload["test_snr_db"] = tuple(payload["test_snr_db"])
-    payload["noise_split_fractions"] = tuple(payload["noise_split_fractions"])
-    payload["cross_eval_encoders"] = tuple(payload["cross_eval_encoders"])
-    payload["cross_eval_frontends"] = tuple(payload["cross_eval_frontends"])
-    payload["cross_eval_snr_db"] = tuple(payload["cross_eval_snr_db"])
-    payload["cnn_channels"] = tuple(payload["cnn_channels"])
-    payload["telephone_band_hz"] = tuple(payload["telephone_band_hz"])
+    for key in (
+        "seeds", "train_snr_range_db", "test_snr_db", "noise_split_fractions",
+        "train_noise_families", "test_noise_families", "babble_sources_range",
+        "positive_control_snr_db", "cnn_channels",
+    ):
+        payload[key] = tuple(payload[key])
     payload["conditions"] = tuple(
-        Condition(name=name, add_noise=spec["add_noise"], stages=tuple(spec["stages"]))
+        Condition(name=name, stages=tuple(spec["stages"]))
         for name, spec in payload["conditions"].items()
     )
     return ExperimentConfig(**payload)

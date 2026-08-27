@@ -1,20 +1,4 @@
-"""Empirical filter design and signal-level characterisation of the front-end.
-
-Cutoff frequencies are not asserted from convention: they are derived from the
-measured long-term spectra of the VCTK speech and the MUSAN noise actually used
-in the study. The rule sacrifices at most ``SPEECH_ENERGY_MARGIN`` of speech
-energy at each band edge, and only cuts where the discarded region is genuinely
-noise-dominated.
-
-The second analysis measures what each arm does to real clips: how much noise it
-removes, and how much it distorts the speech while doing so.
-
-The third analysis is model-free. Waveform SNR says how close the processed
-signal is to the clean one in energy terms, which turns out not to predict
-recognition. The Fisher ratio below instead measures how separable the speakers
-are in a fixed cepstral feature space, with no trained encoder involved, and so
-isolates how much speaker-discriminative information the front-end preserves.
-"""
+"""Frozen band-pass design and signal-level controls for the factorial study."""
 
 from __future__ import annotations
 
@@ -23,255 +7,111 @@ import json
 import numpy as np
 
 from src.config import ExperimentConfig
-from src.corpus import ClipRecord, load_clips, load_manifest
-from src.features import (
-    OCTAVE_BAND_EDGES,
-    band_power,
-    mfcc_frames,
-    mfcc_statistics,
-    residual_snr_db,
-    welch_psd,
-)
-from src.noise import load_noise_pool_for_split, mix_at_snr, noise_for_sample
-from src.pipeline import build_chain
-
-#: Fraction of total speech energy we accept discarding at each band edge.
-#: 0.01 removes 13% of the noise energy for 2.4% of the speech energy on this
-#: corpus; larger margins cut into the formant region.
-SPEECH_ENERGY_MARGIN = 0.01
-
-#: Clips sampled when characterising the front-end at the signal level.
-DSP_EFFECT_CLIPS = 200
-
-#: Clips sampled for the model-free speaker-separability measurement.
-DISCRIMINABILITY_CLIPS = 900
+from src.corpus import load_clips, load_manifest
+from src.features import band_power, residual_snr_db, welch_psd
+from src.noise import gaussian_positive_control, load_noise_pool_for_split, load_noise_metadata, make_mixture
 
 
-def average_psd(
-    waveforms: np.ndarray, sample_rate: int, nperseg: int = 512, limit: int = 800
-) -> tuple[np.ndarray, np.ndarray]:
-    """Long-term average PSD over a sample of clips."""
+def config_hash(config: ExperimentConfig) -> str:
+    """Hash all design-affecting configuration, not a hand-copied cutoff."""
+    return config.config_hash
+
+
+def average_psd(waveforms: np.ndarray, sample_rate: int, limit: int = 800) -> tuple[np.ndarray, np.ndarray]:
     subset = waveforms[: min(limit, len(waveforms))]
-    freqs, accumulated = welch_psd(subset[0], sample_rate, nperseg)
+    if not len(subset):
+        raise ValueError("cannot derive a filter from zero waveforms")
+    frequencies, total = welch_psd(subset[0], sample_rate, 512)
     for waveform in subset[1:]:
-        _, psd = welch_psd(waveform, sample_rate, nperseg)
-        accumulated = accumulated + psd
-    return freqs, accumulated / len(subset)
+        _, psd = welch_psd(waveform, sample_rate, 512)
+        total += psd
+    return frequencies, total / len(subset)
 
 
-def _cutoffs_from_cumulative_energy(
-    freqs: np.ndarray, speech_psd: np.ndarray, margin: float
-) -> tuple[float, float]:
-    cumulative = np.cumsum(speech_psd) / speech_psd.sum()
-    low_index = min(int(np.searchsorted(cumulative, margin)), freqs.size - 2)
-    high_index = int(np.searchsorted(cumulative, 1.0 - margin))
-    high_index = min(max(high_index, low_index + 1), freqs.size - 1)
-    return float(freqs[low_index]), float(freqs[high_index])
-
-
-def analyse_bands(config: ExperimentConfig) -> dict[str, object]:
-    """Measure speech vs noise band power and recommend high-pass / low-pass cutoffs."""
+def derive_band_design(config: ExperimentConfig) -> dict[str, object]:
+    """Freeze the passband using training speech and training MUSAN *only*."""
     speech = load_clips(config.cache_root, "train")
-    # Cutoffs are a design decision, so they may only look at training noise.
-    noise = load_noise_pool_for_split(config.cache_root, "train")
-
-    freqs, speech_psd = average_psd(speech, config.sample_rate)
-    _, noise_psd = average_psd(noise, config.sample_rate)
-    # Match total power so the comparison describes a globally 0 dB SNR mixture.
-    speech_psd = speech_psd / np.trapezoid(speech_psd, freqs)
-    noise_psd = noise_psd / np.trapezoid(noise_psd, freqs)
-
-    band_rows = [
-        {
-            "low_hz": low_hz,
-            "high_hz": high_hz,
-            "speech_power_pct": 100.0 * band_power(freqs, speech_psd, low_hz, high_hz),
-            "noise_power_pct": 100.0 * band_power(freqs, noise_psd, low_hz, high_hz),
-            "band_snr_db": float(
-                10.0
-                * np.log10(
-                    (band_power(freqs, speech_psd, low_hz, high_hz) + 1e-15)
-                    / (band_power(freqs, noise_psd, low_hz, high_hz) + 1e-15)
-                )
-            ),
-        }
-        for low_hz, high_hz in OCTAVE_BAND_EDGES
-    ]
-
-    nyquist = config.sample_rate / 2.0
-    highpass_hz, lowpass_hz = _cutoffs_from_cumulative_energy(
-        freqs, speech_psd, SPEECH_ENERGY_MARGIN
-    )
-    # Only cut a band edge when the discarded region is noise-dominated.
-    if band_power(freqs, speech_psd, 0.0, highpass_hz) > band_power(
-        freqs, noise_psd, 0.0, highpass_hz
-    ):
-        highpass_hz = 20.0
-    if band_power(freqs, speech_psd, lowpass_hz, nyquist) > band_power(
-        freqs, noise_psd, lowpass_hz, nyquist
-    ):
-        lowpass_hz = nyquist * 0.98
-
-    kept = (freqs >= highpass_hz) & (freqs <= lowpass_hz)
-    report = {
-        "speech_energy_margin": SPEECH_ENERGY_MARGIN,
-        "n_speech_clips": int(min(800, len(speech))),
-        "n_noise_segments": int(min(800, len(noise))),
-        "bands": band_rows,
-        "recommended_cutoffs": {
-            "highpass_hz": round(highpass_hz, 1),
-            "lowpass_hz": round(lowpass_hz, 1),
-            "configured_highpass_hz": config.highpass_hz,
-            "configured_lowpass_hz": config.lowpass_hz,
-            "speech_energy_retained_pct": round(
-                100.0 * float(np.trapezoid(speech_psd[kept], freqs[kept])), 2
-            ),
-            "noise_energy_retained_pct": round(
-                100.0 * float(np.trapezoid(noise_psd[kept], freqs[kept])), 2
-            ),
+    noise_pools = [load_noise_pool_for_split(config.cache_root, "train", family) for family in ("noise", "music", "speech")]
+    frequencies, speech_psd = average_psd(speech, config.sample_rate)
+    _, noise_psd = average_psd(np.concatenate(noise_pools), config.sample_rate)
+    speech_psd /= np.trapezoid(speech_psd, frequencies)
+    noise_psd /= np.trapezoid(noise_psd, frequencies)
+    cumulative = np.cumsum(speech_psd) / np.sum(speech_psd)
+    margin = config.band_speech_energy_margin
+    low_index = int(np.searchsorted(cumulative, margin))
+    high_index = int(np.searchsorted(cumulative, 1 - margin))
+    low_index = min(max(1, low_index), len(frequencies) - 2)
+    high_index = min(max(low_index + 1, high_index), len(frequencies) - 1)
+    low, high = float(frequencies[low_index]), float(frequencies[high_index])
+    # An edge may be rejected only if its discarded region is not noise-dominated.
+    if band_power(frequencies, speech_psd, 0, low) > band_power(frequencies, noise_psd, 0, low):
+        low = float(frequencies[1])
+    nyquist = config.sample_rate / 2
+    if band_power(frequencies, speech_psd, high, nyquist) > band_power(frequencies, noise_psd, high, nyquist):
+        high = float(frequencies[-2])
+    if not 0 < low < high < nyquist:
+        raise ValueError("data-derived passband is invalid")
+    keep = (frequencies >= low) & (frequencies <= high)
+    artifact = {
+        "artifact": "frozen-dsp-band-design",
+        "config_hash": config_hash(config),
+        "analysis_inputs": {
+            "speech_split": "train",
+            "noise_partitions": {family: "train" for family in ("noise", "music", "speech")},
+            "n_speech_clips": int(min(800, len(speech))),
+            "n_noise_segments": int(sum(min(800, len(pool)) for pool in noise_pools)),
         },
-        "spectra": {
-            "freqs_hz": freqs.tolist(),
-            "speech_psd": speech_psd.tolist(),
-            "noise_psd": noise_psd.tolist(),
-        },
+        "selection_rule": {"speech_energy_margin": margin, "require_noise_dominance": True, "butterworth_order": config.bandpass_order},
+        "selected_edges_hz": {"low": round(low, 3), "high": round(high, 3)},
+        "retained_energy_pct": {"speech": float(100 * np.trapezoid(speech_psd[keep], frequencies[keep])), "noise": float(100 * np.trapezoid(noise_psd[keep], frequencies[keep]))},
+        "spectra": {"frequencies_hz": frequencies.tolist(), "speech_psd": speech_psd.tolist(), "noise_psd": noise_psd.tolist()},
     }
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    config.dsp_design_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+    return artifact
 
+
+def positive_control_wiener(config: ExperimentConfig) -> dict[str, object]:
+    """DSP implementation check: Gaussian noise should show positive Wiener SNR gain."""
+    from src.pipeline import build_chain
+
+    # A deterministic speech-like envelope creates genuinely quiet STFT frames,
+    # so the test exercises the intended stationary-noise estimator rather than
+    # relying on a chance pause in a corpus utterance.
+    t = np.arange(config.segment_samples) / config.sample_rate
+    clean = (
+        (0.25 * np.sin(2 * np.pi * 300 * t) + 0.10 * np.sin(2 * np.pi * 1400 * t))
+        * np.hanning(config.segment_samples)
+    ).astype(np.float32)
+    chain = build_chain(config.condition("wiener"), config)
+    rows = []
+    for snr in config.positive_control_snr_db:
+        trial = gaussian_positive_control(clean, snr, seed=config.seeds[0] + int(snr * 10))
+        before = residual_snr_db(trial.clean_component, trial.mixture)
+        after = residual_snr_db(trial.clean_component, chain(trial.mixture))
+        rows.append({"input_snr_db": snr, "before_snr_db": before, "after_snr_db": after, "snr_gain_db": after - before})
+    report = {"purpose": "technical DSP-positive control; not recognition evidence", "measurements": rows}
     config.report_root.mkdir(parents=True, exist_ok=True)
-    (config.report_root / "band-analysis.json").write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
+    (config.report_root / "wiener-positive-control.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 
-def analyse_dsp_effect(config: ExperimentConfig) -> dict[str, object]:
-    """Measure noise suppression against speech distortion for every arm.
+def characterize_frontends(config: ExperimentConfig) -> dict[str, object]:
+    """Waveform SNR changes for the actual factorial cells on matched mixtures."""
+    from src.pipeline import build_chain
 
-    ``output_snr_db`` is measured against the clean reference, so it captures
-    residual noise *and* processing artefacts together. ``clean_path_snr_db``
-    runs the same chain on clean input, isolating the distortion the front-end
-    injects by itself; a transparent chain would score arbitrarily high.
-    """
-    records: list[ClipRecord] = load_manifest(config.cache_root, "test")
-    clips = load_clips(config.cache_root, "test")
-    pool = load_noise_pool_for_split(config.cache_root, "test")
-    seed = config.seeds[0]
-    n_clips = min(DSP_EFFECT_CLIPS, len(records))
-
+    clips, records = load_clips(config.cache_root, "test"), load_manifest(config.cache_root, "test")
+    pools = {f: load_noise_pool_for_split(config.cache_root, "test", f) for f in ("noise", "music", "speech")}
+    metadata = {f: load_noise_metadata(config.cache_root, "test", f) for f in pools}
     rows = []
-    for condition in config.conditions:
-        if not condition.add_noise:
-            continue
-        chain = build_chain(condition, config)
-        clean_path = [
-            residual_snr_db(clips[i], chain(clips[i])) for i in range(n_clips)
-        ]
-
-        for input_snr in config.test_snr_db:
-            output_snr = []
-            for index in range(n_clips):
-                noisy = mix_at_snr(
-                    clips[index],
-                    noise_for_sample(records[index].sample_id, seed, pool),
-                    input_snr,
-                )
-                output_snr.append(residual_snr_db(clips[index], chain(noisy)))
-            rows.append(
-                {
-                    "condition": condition.name,
-                    "stages": list(condition.stages),
-                    "input_snr_db": float(input_snr),
-                    "output_snr_db": float(np.mean(output_snr)),
-                    "clean_path_snr_db": float(np.mean(clean_path)),
-                }
-            )
-
-    baseline = {
-        row["input_snr_db"]: row["output_snr_db"]
-        for row in rows
-        if row["condition"] == "A_raw_noisy"
-    }
-    for row in rows:
-        row["snr_gain_db"] = row["output_snr_db"] - baseline[row["input_snr_db"]]
-
-    report = {"n_clips": n_clips, "seed": seed, "measurements": rows}
-    config.report_root.mkdir(parents=True, exist_ok=True)
-    (config.report_root / "dsp-effect.json").write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
-    return report
-
-
-def _fisher_ratio(features: np.ndarray, labels: np.ndarray) -> dict[str, float]:
-    """Between-speaker scatter over within-speaker scatter, per feature dimension.
-
-    Standardising first makes the ratio comparable across arms that change the
-    overall feature scale (band limiting does exactly that).
-    """
-    features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-8)
-    grand_mean = features.mean(axis=0)
-
-    within, between = [], []
-    for label in np.unique(labels):
-        group = features[labels == label]
-        within.append(np.sum(group.var(axis=0)) * len(group))
-        between.append(np.sum((group.mean(axis=0) - grand_mean) ** 2) * len(group))
-
-    within_scatter = float(np.sum(within) / len(features))
-    between_scatter = float(np.sum(between) / len(features))
-    return {
-        "within_speaker_scatter": within_scatter,
-        "between_speaker_scatter": between_scatter,
-        "fisher_ratio": between_scatter / (within_scatter + 1e-12),
-    }
-
-
-def analyse_speaker_discriminability(config: ExperimentConfig) -> dict[str, object]:
-    """Measure speaker separability in a fixed cepstral space, with no model.
-
-    Waveform SNR measures energy-domain fidelity; this measures whether the
-    speakers are still told apart after the front-end. The two can disagree,
-    and where they do the recognition results follow this measure.
-    """
-    records: list[ClipRecord] = load_manifest(config.cache_root, "test")
-    clips = load_clips(config.cache_root, "test")
-    pool = load_noise_pool_for_split(config.cache_root, "test")
-    seed = config.seeds[0]
-    n_clips = min(DISCRIMINABILITY_CLIPS, len(records))
-
-    speakers = sorted({record.speaker_id for record in records[:n_clips]})
-    labels = np.array([speakers.index(records[i].speaker_id) for i in range(n_clips)])
-    probe_snrs = (min(config.test_snr_db), max(config.test_snr_db))
-
-    rows = []
-    for condition in config.conditions:
-        chain = build_chain(condition, config)
-        for input_snr in probe_snrs:
-            features = []
-            for index in range(n_clips):
-                signal = clips[index]
-                if condition.add_noise:
-                    signal = mix_at_snr(
-                        signal,
-                        noise_for_sample(records[index].sample_id, seed, pool),
-                        input_snr,
-                    )
-                features.append(
-                    mfcc_statistics(mfcc_frames(chain(signal), config.sample_rate))
-                )
-            rows.append(
-                {
-                    "condition": condition.name,
-                    "stages": list(condition.stages),
-                    "input_snr_db": float(input_snr),
-                    **_fisher_ratio(np.stack(features), labels),
-                }
-            )
-            if not condition.add_noise:
-                break  # the clean arm has no SNR axis
-
-    report = {"n_clips": n_clips, "n_speakers": len(speakers), "measurements": rows}
-    (config.report_root / "discriminability.json").write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
+    for family in config.test_noise_families:
+        for snr in config.test_snr_db:
+            mixtures = [make_mixture(clips[i], records[i].sample_id, seed=config.seeds[0], family=family, snr_db=snr, pools=pools, pool_metadata=metadata, babble_sources_range=config.babble_sources_range) for i in range(min(100, len(records)))]
+            raw = float(np.mean([residual_snr_db(x.clean_component, x.mixture) for x in mixtures]))
+            for condition in config.conditions:
+                output = [build_chain(condition, config)(x.mixture) for x in mixtures]
+                value = float(np.mean([residual_snr_db(x.clean_component, y) for x, y in zip(mixtures, output, strict=True)]))
+                rows.append({"cell": condition.name, "family": family, "input_snr_db": snr, "output_snr_db": value, "snr_gain_db": value - raw})
+    report = {"n_clips": min(100, len(records)), "measurements": rows}
+    (config.report_root / "front-end-characterisation.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

@@ -1,309 +1,150 @@
-"""Offline tests: DSP correctness, mixing, feature shapes, and metric behaviour.
-
-These run without the corpus so they stay fast and independent of the cache.
-"""
+"""Offline invariants for the frozen-CNN 2×2 factorial study."""
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from src import dsp
-from src.config import Condition, load_config
-from src.corpus import trim_silence
-from src.eval import (
-    classification_metrics,
-    clustering_metrics,
-    enrollment_split,
-    paired_significance,
-)
-from src.features import handcrafted_features, octave_band_powers, spectral_entropy
+from src.analysis import config_hash
+from src.config import Condition, FACTORIAL_CELLS, load_config
+from src.corpus import ClipRecord
 from src.noise import (
-    NOISE_PARTITIONS,
-    SPLIT_NOISE_PARTITION,
-    deterministic_choice,
-    mix_at_snr,
-    split_noise_files,
+    NOISE_PARTITIONS, deterministic_uniform, gaussian_positive_control, make_mixture,
+    measured_snr_db, mix_at_snr_components, split_noise_files, training_augmentation_choice,
 )
-from src.pipeline import build_chain
+from src.pipeline import build_chain, frozen_band_edges, process_split
+from src.study import paired_cluster_bootstrap
 
-SAMPLE_RATE = 16000
-DURATION = 2.0
-N_SAMPLES = int(SAMPLE_RATE * DURATION)
-TIME = np.arange(N_SAMPLES) / SAMPLE_RATE
+RATE, N = 16000, 32000
 
 
-def tone(freq_hz: float, amplitude: float = 1.0) -> np.ndarray:
-    return (amplitude * np.sin(2 * np.pi * freq_hz * TIME)).astype(np.float32)
+def signal() -> np.ndarray:
+    t = np.arange(N) / RATE
+    return (.25 * np.sin(2 * np.pi * 300 * t) + .1 * np.sin(2 * np.pi * 1400 * t)).astype(np.float32)
 
 
-def bin_amplitude(waveform: np.ndarray, freq_hz: float) -> float:
-    spectrum = np.fft.rfft(waveform)
-    return float(abs(spectrum[int(round(freq_hz * waveform.size / SAMPLE_RATE))]))
+def config_at(tmp_path: Path):
+    return replace(load_config("configs/config.json"), output_root=str(tmp_path), run_id=1)
 
 
-def snr_db(reference: np.ndarray, estimate: np.ndarray) -> float:
-    length = min(reference.size, estimate.size)
-    error = estimate[:length] - reference[:length]
-    return float(
-        10 * np.log10(np.sum(reference[:length] ** 2) / (np.sum(error**2) + 1e-12))
-    )
+def freeze_design(config) -> None:
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    config.dsp_design_path.write_text(json.dumps({"artifact": "frozen-dsp-band-design", "config_hash": config_hash(config), "selected_edges_hz": {"low": 80.0, "high": 6000.0}}))
 
 
-# --------------------------------------------------------------------------- #
-# Filtering
-# --------------------------------------------------------------------------- #
-def test_highpass_attenuates_below_cutoff_and_passes_above():
-    mixture = tone(40) + tone(500)
-    filtered = dsp.highpass(mixture, SAMPLE_RATE, 80.0)
-    assert bin_amplitude(filtered, 40) / bin_amplitude(mixture, 40) < 0.05
-    assert bin_amplitude(filtered, 500) / bin_amplitude(mixture, 500) > 0.95
+def test_source_disjoint_musan_partitions():
+    files = [Path(f"musan/speech/{source}/record-{i}.wav") for source in ("a", "b") for i in range(100)]
+    split = split_noise_files(files, seed=7, fractions=(.6, .15, .25))
+    assert set().union(*(set(split[x]) for x in NOISE_PARTITIONS)) == set(files)
+    assert all(not set(split[a]) & set(split[b]) for a in NOISE_PARTITIONS for b in NOISE_PARTITIONS if a != b)
+    assert split_noise_files(files, 7, (.6, .15, .25)) == split
 
 
-def test_lowpass_attenuates_above_cutoff():
-    mixture = tone(500) + tone(6000)
-    filtered = dsp.lowpass(mixture, SAMPLE_RATE, 4100.0)
-    assert bin_amplitude(filtered, 6000) / bin_amplitude(mixture, 6000) < 0.05
-    assert bin_amplitude(filtered, 500) / bin_amplitude(mixture, 500) > 0.95
+def test_training_augmentation_is_deterministic_continuous_and_balanced_family():
+    draws = [training_augmentation_choice(f"p1/u{i}", seed=11, epoch=3, p_noise=1, families=("noise", "music", "speech", "babble"), snr_range_db=(0, 20)) for i in range(200)]
+    assert draws == [training_augmentation_choice(f"p1/u{i}", seed=11, epoch=3, p_noise=1, families=("noise", "music", "speech", "babble"), snr_range_db=(0, 20)) for i in range(200)]
+    assert all(0 <= snr <= 20 for _, _, snr in draws)
+    assert len({round(float(snr), 4) for _, _, snr in draws}) > 100
+    counts = {family: sum(x[1] == family for x in draws) for family in ("noise", "music", "speech", "babble")}
+    assert all(counts[family] > 25 for family in counts)
+    assert deterministic_uniform("x", 0, 1) == deterministic_uniform("x", 0, 1)
 
 
-def test_bandpass_keeps_only_the_passband():
-    mixture = tone(100) + tone(1000) + tone(6000)
-    filtered = dsp.bandpass(mixture, SAMPLE_RATE, 300.0, 3400.0)
-    assert bin_amplitude(filtered, 1000) / bin_amplitude(mixture, 1000) > 0.9
-    assert bin_amplitude(filtered, 100) / bin_amplitude(mixture, 100) < 0.1
-    assert bin_amplitude(filtered, 6000) / bin_amplitude(mixture, 6000) < 0.1
-
-
-def test_cutoff_above_nyquist_is_rejected():
-    with pytest.raises(ValueError):
-        dsp.highpass(tone(500), SAMPLE_RATE, 9000.0)
-
-
-def test_notch_detection_finds_injected_tone():
-    rng = np.random.default_rng(0)
-    noisy_tone = (tone(1000, 0.5) + rng.normal(0, 0.05, N_SAMPLES)).astype(np.float32)
-    peaks = dsp.detect_tonal_peaks(noisy_tone, SAMPLE_RATE)
-    assert peaks and abs(peaks[0] - 1000.0) < 50.0
-
-    notched = dsp.adaptive_notch(noisy_tone, SAMPLE_RATE)
-    assert bin_amplitude(notched, 1000) / bin_amplitude(noisy_tone, 1000) < 0.2
-
-
-def test_adaptive_notch_is_a_no_op_without_tonal_interference():
-    rng = np.random.default_rng(1)
-    broadband = rng.normal(0, 0.1, N_SAMPLES).astype(np.float32)
-    assert dsp.detect_tonal_peaks(broadband, SAMPLE_RATE) == []
-
-
-# --------------------------------------------------------------------------- #
-# Denoising
-# --------------------------------------------------------------------------- #
-@pytest.fixture
-def noisy_pair():
-    rng = np.random.default_rng(2)
-    clean = (tone(300) * np.hanning(N_SAMPLES)).astype(np.float32)
-    return clean, (clean + rng.normal(0, 0.1, N_SAMPLES)).astype(np.float32)
-
-
-def test_stft_wiener_improves_snr(noisy_pair):
-    clean, noisy = noisy_pair
-    assert (
-        snr_db(clean, dsp.stft_wiener(noisy, SAMPLE_RATE)) > snr_db(clean, noisy) + 5.0
-    )
-
-
-def test_spectral_subtraction_improves_snr(noisy_pair):
-    clean, noisy = noisy_pair
-    assert (
-        snr_db(clean, dsp.spectral_subtraction(noisy, SAMPLE_RATE))
-        > snr_db(clean, noisy) + 5.0
-    )
-
-
-def test_wiener_gain_floor_bounds_attenuation():
-    rng = np.random.default_rng(3)
-    noise_only = rng.normal(0, 0.1, N_SAMPLES).astype(np.float32)
-    denoised = dsp.stft_wiener(noise_only, SAMPLE_RATE, gain_floor_db=-6.0)
-    ratio = np.sqrt(np.mean(denoised**2) / np.mean(noise_only**2))
-    assert ratio > 10 ** (-6.0 / 20.0) * 0.5
-
-
-def test_denoisers_preserve_length(noisy_pair):
-    _, noisy = noisy_pair
-    assert dsp.stft_wiener(noisy, SAMPLE_RATE).size == noisy.size
-    assert dsp.spectral_subtraction(noisy, SAMPLE_RATE).size == noisy.size
-
-
-# --------------------------------------------------------------------------- #
-# Mixing
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("target_snr", [0.0, 5.0, 20.0])
-def test_mix_at_snr_hits_the_requested_ratio(target_snr):
+def test_mixing_records_target_measured_snr_and_shared_gain():
     rng = np.random.default_rng(4)
-    speech = (tone(300) * np.hanning(N_SAMPLES)).astype(np.float32)
-    noise = rng.normal(0, 0.3, N_SAMPLES).astype(np.float32)
-    mixture = mix_at_snr(speech, noise, target_snr)
-
-    # Anti-clipping applies a single unknown gain to speech and noise alike;
-    # recover it by projecting the mixture onto the (uncorrelated) speech.
-    gain = float(np.dot(mixture, speech) / np.dot(speech, speech))
-    residual = mixture - gain * speech
-    measured = 10 * np.log10(np.mean((gain * speech) ** 2) / np.mean(residual**2))
-    assert abs(measured - target_snr) < 1.0
+    mixture, clean, noise = mix_at_snr_components(signal(), rng.normal(0, 1, N).astype(np.float32), 3.7)
+    assert mixture.shape == clean.shape == noise.shape
+    assert abs(measured_snr_db(clean, noise) - 3.7) < 1e-5
+    assert np.max(np.abs(mixture)) <= .99001
 
 
-def test_deterministic_choice_is_stable_and_in_range():
-    assert deterministic_choice("11:p225/clip-000:noise", 2000) == deterministic_choice(
-        "11:p225/clip-000:noise", 2000
-    )
-    assert 0 <= deterministic_choice("11:p225/clip-000:noise", 2000) < 2000
-    assert deterministic_choice("a", 100) != deterministic_choice("b", 100)
+def test_babble_is_sum_of_normalised_components_and_auditable():
+    pools = {"noise": np.ones((10, N), np.float32), "music": np.ones((10, N), np.float32), "speech": np.stack([np.full(N, i + 1, np.float32) for i in range(10)])}
+    metadata = {name: [{"index": i, "source_recording": f"{name}-{i}.wav", "offset_samples": 0} for i in range(10)] for name in pools}
+    result = make_mixture(signal(), "p1/x", seed=1, family="babble", snr_db=5, pools=pools, pool_metadata=metadata, babble_sources_range=(3, 7))
+    assert 3 <= len(result.metadata["source_recordings"]) <= 7
+    assert abs(result.metadata["measured_snr_db"] - 5) < 1e-5
+    assert np.isfinite(result.mixture).all()
 
 
-def test_noise_partitions_share_no_recording():
-    files = [
-        Path(f"musan/noise/{corpus}/noise-{index:04d}.wav")
-        for corpus in ("free-sound", "sound-bible")
-        for index in range(200)
-    ]
-    partitions = split_noise_files(files, seed=11, fractions=(0.6, 0.15, 0.25))
-
-    selected = [set(partitions[name]) for name in NOISE_PARTITIONS]
-    assert set().union(*selected) == set(files)
-    for left in range(len(selected)):
-        for right in range(left + 1, len(selected)):
-            assert not selected[left] & selected[right]
-
-    # Stratified: every partition keeps both MUSAN sub-corpora.
-    for group in selected:
-        assert {path.parent.name for path in group} == {"free-sound", "sound-bible"}
-
-    assert split_noise_files(files, 11, (0.6, 0.15, 0.25)) == partitions
-
-
-def test_evaluation_splits_never_use_training_noise():
-    assert SPLIT_NOISE_PARTITION["train"] == "train"
-    assert SPLIT_NOISE_PARTITION["test"] == "test"
-    assert SPLIT_NOISE_PARTITION["seen_test"] == "test"
-    assert SPLIT_NOISE_PARTITION["validation"] == "validation"
-
-
-# --------------------------------------------------------------------------- #
-# Corpus helpers
-# --------------------------------------------------------------------------- #
-def test_trim_silence_removes_leading_and_trailing_silence():
-    speech = (tone(300) * np.hanning(N_SAMPLES)).astype(np.float32)
-    padded = np.concatenate(
-        [np.zeros(8000, np.float32), speech, np.zeros(8000, np.float32)]
-    )
-    trimmed = trim_silence(padded)
-    assert trimmed.size < padded.size
-    assert trimmed.size >= speech.size * 0.5
-
-
-# --------------------------------------------------------------------------- #
-# Features
-# --------------------------------------------------------------------------- #
-def test_handcrafted_features_are_finite_and_fixed_width():
-    rng = np.random.default_rng(5)
-    first = handcrafted_features(tone(300), SAMPLE_RATE)
-    second = handcrafted_features(
-        rng.normal(0, 0.1, N_SAMPLES).astype(np.float32), SAMPLE_RATE
-    )
-    assert first.shape == second.shape
-    assert np.isfinite(first).all() and np.isfinite(second).all()
-
-
-def test_spectral_entropy_ranks_noise_above_a_pure_tone():
-    rng = np.random.default_rng(6)
-    noise = rng.normal(0, 0.1, N_SAMPLES).astype(np.float32)
-    assert spectral_entropy(noise, SAMPLE_RATE) > spectral_entropy(
-        tone(300), SAMPLE_RATE
-    )
-
-
-def test_octave_band_power_tracks_the_active_band():
-    powers = octave_band_powers(tone(300), SAMPLE_RATE)
-    assert int(np.argmax(powers)) == 2  # the 250-500 Hz band
-
-
-# --------------------------------------------------------------------------- #
-# Pipeline wiring
-# --------------------------------------------------------------------------- #
-def test_build_chain_applies_stages_in_order():
-    config = load_config("configs/dsp501-v2.json")
-    chain = build_chain(config.condition("B_full"), config)
-    assert chain.names == ("highpass", "lowpass", "notch", "wiener")
-
-    mixture = tone(100) + tone(6000) + tone(1000)
-    processed = chain(mixture)
-    assert processed.size == mixture.size
-    assert bin_amplitude(processed, 6000) < bin_amplitude(mixture, 6000) * 0.1
-
-
-def test_unknown_stage_is_rejected():
+def test_frozen_cutoff_artifact_is_required_and_hash_bound(tmp_path):
+    config = config_at(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        frozen_band_edges(config)
+    freeze_design(config)
+    assert frozen_band_edges(config) == (80.0, 6000.0)
+    changed = replace(config, bandpass_order=2)
     with pytest.raises(ValueError):
-        Condition(name="bad", add_noise=True, stages=("wavelet",))
+        frozen_band_edges(changed)
 
 
-def test_pipeline_a_has_no_dsp_stages():
-    config = load_config("configs/dsp501-v2.json")
-    assert config.condition("A_raw_noisy").stages == ()
-    assert config.condition("A_raw_noisy").add_noise is True
-    assert config.condition("clean").add_noise is False
+def test_all_four_cells_receive_identical_pre_dsp_mixture(tmp_path):
+    config = config_at(tmp_path); freeze_design(config)
+    cache = config.cache_root; cache.mkdir(parents=True)
+    record = ClipRecord("p1/u/clip", "p1", "x.wav", "test", 2.0, 0.0)
+    (cache / "test.jsonl").write_text(json.dumps(record.__dict__) + "\n")
+    np.save(cache / "test.npy", np.stack([signal()]))
+    manifest = {"families": {family: {"test": {"segments": [{"index": i, "source_recording": f"{family}-{i}.wav", "offset_samples": 0} for i in range(4)]}} for family in ("noise", "music", "speech")}}
+    (cache / "musan-pools.json").write_text(json.dumps(manifest))
+    for family in ("noise", "music", "speech"):
+        np.save(cache / f"musan-{family}-test.npy", np.random.default_rng(len(family)).normal(0, 1, (4, N)).astype(np.float32))
+    mixtures = [process_split(np.stack([signal()]), [record], cell, config, seed=11, family="noise", snr_db=5).mixtures for cell in config.conditions]
+    assert all(np.array_equal(mixtures[0], item) for item in mixtures[1:])
 
 
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
-def test_classification_metrics_on_a_perfect_prediction():
-    labels = np.array([0, 0, 1, 1, 2, 2])
-    metrics = classification_metrics(labels, labels)
-    assert metrics["accuracy"] == 1.0
-    assert metrics["f1_macro"] == 1.0
-    assert np.trace(np.array(metrics["confusion_matrix"])) == labels.size
+def test_clean_controls_are_available_for_each_cell(tmp_path):
+    config = config_at(tmp_path); freeze_design(config)
+    record = ClipRecord("p1/u/clip", "p1", "x.wav", "test", 2.0, 0.0)
+    clips = np.stack([signal()])
+    for cell in config.conditions:
+        output = process_split(clips, [record], cell, config, seed=11, family=None, snr_db=None)
+        assert output.mixing[0]["family"] == "clean"
+        assert output.mixing[0]["measured_snr_db"] is None
 
 
-def test_clustering_metrics_separate_well_formed_clusters():
-    rng = np.random.default_rng(7)
-    centres = rng.normal(0, 1, (6, 16))
-    centres /= np.linalg.norm(centres, axis=1, keepdims=True)
-    embeddings = np.repeat(centres, 20, axis=0) + rng.normal(0, 0.01, (120, 16))
-    labels = np.repeat(np.arange(6), 20)
-    metrics = clustering_metrics(
-        embeddings.astype(np.float32), labels, min_cluster_size=5
-    )
-    assert metrics["agglomerative_ari"] > 0.95
-    assert metrics["agglomerative_purity"] > 0.95
+def test_seen_test_uses_test_partition_for_pool_and_metadata(tmp_path):
+    config = config_at(tmp_path); freeze_design(config)
+    cache = config.cache_root; cache.mkdir(parents=True)
+    record = ClipRecord("p1/seen/clip", "p1", "x.wav", "seen_test", 2.0, 0.0)
+    manifest = {"families": {family: {"test": {"segments": [{"index": 0, "source_recording": f"{family}.wav", "offset_samples": 0}]}} for family in ("noise", "music", "speech")}}
+    (cache / "musan-pools.json").write_text(json.dumps(manifest))
+    for family in ("noise", "music", "speech"):
+        np.save(cache / f"musan-{family}-test.npy", np.ones((1, N), np.float32))
+    output = process_split(np.stack([signal()]), [record], config.condition("raw"), config, seed=11, family="noise", snr_db=5)
+    assert output.mixing[0]["source_recordings"][0]["source_recording"] == "noise.wav"
 
 
-def test_enrollment_split_is_disjoint_and_covers_every_speaker():
-    from src.corpus import ClipRecord
+def test_wiener_positive_control_has_low_snr_gain():
+    clean = signal() * np.hanning(N)
+    for snr in (0, 5):
+        trial = gaussian_positive_control(clean, snr, seed=snr)
+        before = 10 * np.log10(np.mean(trial.clean_component**2) / np.mean((trial.mixture - trial.clean_component) ** 2))
+        after = 10 * np.log10(np.mean(trial.clean_component**2) / np.mean((dsp.stft_wiener(trial.mixture, RATE) - trial.clean_component) ** 2))
+        assert after > before
 
-    records = [
-        ClipRecord(f"p{s}/u/clip-{i:03d}", f"p{s}", "x.wav", "test", 2.0, 0.0)
-        for s in range(4)
-        for i in range(10)
+
+def test_factorial_bootstrap_resamples_speakers_not_seed_snr_as_independent():
+    rows = [
+        {"speaker_id": speaker, "seed": seed, "snr": snr, "delta": delta}
+        for speaker, delta in (("p1", .2), ("p2", -.1), ("p3", .1))
+        for seed in (11, 22, 33) for snr in (0, 5)
     ]
-    enrol, query = enrollment_split(records, enrollment_clips=3)
-    assert set(enrol).isdisjoint(query)
-    assert enrol.size == 4 * 3
-    assert query.size == 4 * 7
+    result = paired_cluster_bootstrap(rows, replicates=500, seed=9)
+    assert result["n_speakers"] == 3
+    assert result["n_paired_speaker_strata"] == 18
+    assert result["resampling_unit"].startswith("test speaker")
+    assert abs(result["mean_delta"] - (0.2 - .1 + .1) / 3) < 1e-9
 
 
-def test_paired_significance_detects_a_consistent_improvement():
-    baseline = [0.50, 0.52, 0.48, 0.51]
-    proposed = [0.60, 0.61, 0.59, 0.62]
-    result = paired_significance(baseline, proposed)
-    assert result["mean_difference"] > 0
-    assert result["t_p_value"] < 0.05
-    assert result["ci_low"] > 0
-
-
-def test_paired_significance_handles_identical_samples():
-    result = paired_significance([0.5, 0.5], [0.5, 0.5])
-    assert result["mean_difference"] == 0.0
-    assert result["t_p_value"] == 1.0
+def test_invalid_config_and_stage_are_rejected(tmp_path):
+    payload = json.loads(Path("configs/config.json").read_text())
+    payload["p_noise"] = 1.2
+    path = tmp_path / "bad.json"; path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError): load_config(path)
+    with pytest.raises(ValueError): Condition("bad", ("magic",))
+    assert tuple(load_config("configs/config.json").condition(x).name for x in FACTORIAL_CELLS) == FACTORIAL_CELLS

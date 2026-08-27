@@ -1,933 +1,272 @@
 ---
-title: "Thiết kế DSP Front-End Kháng Nhiễu cho Học Speaker Embedding"
-subtitle: "DSP501 Final Assignment — bản tiếng Việt để review nội bộ"
-author: "[Tên nhóm; họ tên và MSSV]"
+title: "DSP tiền xử lý ở suy luận cho CNN nhận dạng người nói kháng nhiễu"
+subtitle: "Ablation 2×2 trên encoder đóng băng — run-1"
+author: "[Tên nhóm; họ tên, MSSV và affiliation]"
 date: last-modified
-format:
-  html:
-    embed-resources: true
-    toc: true
-    number-sections: true
-  pdf:
-    toc: true
-    number-sections: true
 bibliography: references.bib
-execute:
-  echo: false
-  warning: false
+csl: ieee.csl
+format:
+  html: {embed-resources: true, toc: true, number-sections: true}
+  pdf: {toc: true, number-sections: true}
+execute: {echo: false, warning: false}
 ---
 
 ```{python}
-# | label: load-artifacts
+#| label: load-run-1-artifacts
 from __future__ import annotations
-
-import csv
-import json
-from collections import defaultdict
+import csv, json
+from collections import Counter, defaultdict
 from pathlib import Path
+from IPython.display import Image, Markdown, display
 
-from IPython.display import Markdown, display
-
-PROJECT_ROOT = Path.cwd().resolve()
-CONFIG = json.loads((PROJECT_ROOT / "configs" / "dsp501-v2.json").read_text(encoding="utf-8"))
-STUDY_ROOT = PROJECT_ROOT / CONFIG["output_root"] / CONFIG["study_id"]
-REPORTS = STUDY_ROOT / "reports"
-
-REQUIRED = {
-    "metric summary": REPORTS / "metric-summary.csv",
-    "significance tests": REPORTS / "significance.json",
-    "band analysis": REPORTS / "band-analysis.json",
-    "front-end characterisation": REPORTS / "dsp-effect.json",
-    "tuning result": STUDY_ROOT / "tuning.json",
-}
-missing = [f"{name} ({path})" for name, path in REQUIRED.items() if not path.is_file()]
-if missing:
-    raise FileNotFoundError(
-        "This report renders from saved artifacts. Run "
-        "`uv run python run.py all --config configs/dsp501-v2.json` first.\nMissing:\n- "
-        + "\n- ".join(missing)
-    )
-
-with (REPORTS / "metric-summary.csv").open(newline="", encoding="utf-8") as stream:
-    METRICS = list(csv.DictReader(stream))
-SIGNIFICANCE = json.loads((REPORTS / "significance.json").read_text(encoding="utf-8"))
-BANDS = json.loads((REPORTS / "band-analysis.json").read_text(encoding="utf-8"))
-DSP_EFFECT = json.loads((REPORTS / "dsp-effect.json").read_text(encoding="utf-8"))
-TUNING = json.loads((STUDY_ROOT / "tuning.json").read_text(encoding="utf-8"))
-NOISE_SPLIT = json.loads(
-    (STUDY_ROOT / "cache" / "noise-pool.json").read_text(encoding="utf-8")
-)
-
-
-def optional(path: Path):
-    """Artifacts from stages a reader may choose not to run."""
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
-
-
-CROSS_EVAL = optional(REPORTS / "cross-eval.json")
-DISCRIMINABILITY = optional(REPORTS / "discriminability.json")
-
-#: Front-end column labels used in the cross-evaluation table.
-FRONTEND_LABEL = {"clean": "no noise", "A_raw_noisy": "no DSP", "B_full": "full DSP"}
-
-
-def cross(encoder: str, frontend: str, snr: float | None) -> float | None:
-    """Mean cross-evaluation accuracy over seeds; ``snr=None`` is the clean cell."""
-    values = [
-        row["accuracy"]
-        for row in (CROSS_EVAL or [])
-        if row["encoder"] == encoder
-        and row["frontend"] == frontend
-        and row["test_snr_db"] == snr
-    ]
-    return sum(values) / len(values) if values else None
-
-
-def effect(condition: str, input_snr: float, field: str) -> float | None:
-    for row in DSP_EFFECT["measurements"]:
-        if row["condition"] == condition and row["input_snr_db"] == input_snr:
-            return row[field]
-    return None
-
-
-def fisher(condition: str, input_snr: float) -> float | None:
-    for row in (DISCRIMINABILITY or {}).get("measurements", []):
-        if row["condition"] == condition and row["input_snr_db"] == input_snr:
-            return row["fisher_ratio"]
-    return None
-
-
-def fmt(value: float | None, places: int = 4, sign: bool = False) -> str:
-    if value is None:
-        return "—"
-    return f"{value:+.{places}f}" if sign else f"{value:.{places}f}"
-
-
-def mean_by(
-    condition: str, metric: str, model: str = "cnn", protocol: str = "unseen"
-) -> float | None:
-    values = [
-        float(row[metric])
-        for row in METRICS
-        if row["condition"] == condition
-        and row["model"] == model
-        and row.get("protocol", "unseen") == protocol
-        and row[metric]
-    ]
-    return sum(values) / len(values) if values else None
-
-
-def table(rows: list[list[object]], header: list[str]) -> Markdown:
-    body = "\n".join("| " + " | ".join(str(cell) for cell in row) + " |" for row in rows)
-    return Markdown(
-        "| " + " | ".join(header) + " |\n"
-        "|" + "|".join(["---"] * len(header)) + "|\n" + body
-    )
-
-
-HARDEST = min(float(s) for s in CONFIG["test_snr_db"])
-EASIEST = max(float(s) for s in CONFIG["test_snr_db"])
+ROOT = Path.cwd().resolve(); RUN_ID = 1
+working = json.loads((ROOT / "configs" / "config.json").read_text())
+RUN = ROOT / working["output_root"] / working["study_id"] / "runs" / f"run-{RUN_ID}"
+REPORTS = RUN / "reports"
+REQUIRED = [RUN / name for name in ("config.json", "run-manifest.json", "dsp-design.json", "training-summary.json")]
+REQUIRED += [REPORTS / name for name in ("metric-summary.csv", "factorial-bootstrap.json", "wiener-positive-control.json", "front-end-characterisation.json", "raw-error-samples.json")]
+missing = [str(p.relative_to(ROOT)) for p in REQUIRED if not p.is_file()]
+if missing: raise FileNotFoundError("Thiếu artifact run-1:\n- " + "\n- ".join(missing))
+CONFIG = json.loads((RUN / "config.json").read_text()); MANIFEST = json.loads((RUN / "run-manifest.json").read_text())
+DESIGN = json.loads((RUN / "dsp-design.json").read_text()); TRAINING = json.loads((RUN / "training-summary.json").read_text())
+FACTORIAL = json.loads((REPORTS / "factorial-bootstrap.json").read_text()); POSITIVE = json.loads((REPORTS / "wiener-positive-control.json").read_text())
+with (REPORTS / "metric-summary.csv").open(newline="") as f: METRICS = list(csv.DictReader(f))
+CELLS = ("raw", "bandpass", "wiener", "bandpass_wiener"); FAMILIES = tuple(CONFIG["test_noise_families"]); SNRS = tuple(map(float, CONFIG["test_snr_db"]))
+EVALUATIONS = []
+for path in sorted(RUN.glob("seed-*/robust_cnn/evaluation-*.json")):
+    item = json.loads(path.read_text()); item["_path"] = path; EVALUATIONS.append(item)
+def mean(xs): return sum(xs)/len(xs) if xs else None
+def fmt(x, n=3): return "—" if x is None else f"{x:.{n}f}"
+def table(headers, rows):
+    return Markdown("| " + " | ".join(headers) + " |\n|" + "|".join(["---"]*len(headers)) + "|\n" + "\n".join("| " + " | ".join(map(str,row)) + " |" for row in rows))
+def vals(cell, protocol="unseen", domain="noisy", family=None, snr=None, seed=None, field="accuracy"):
+    return [float(x[field]) for x in METRICS if x["cell"]==cell and x["protocol"]==protocol and x["audio_domain"]==domain and (family is None or x["noise_family"]==family) and (snr is None or float(x["test_snr_db"])==float(snr)) and (seed is None or int(x["seed"])==int(seed))]
+def mm(cell, **kwargs): return mean(vals(cell, **kwargs))
+def report_metrics(cell, protocol="unseen", domain="noisy"):
+    rs=[x for x in EVALUATIONS if x["cell"]==cell and x["protocol"]==protocol and x["audio_domain"]==domain]
+    return {k:mean([float(x["nearest_centroid"][k]) for x in rs]) for k in ("accuracy","precision_macro","recall_macro","f1_macro")}
+def fig(name):
+    path=REPORTS/name
+    if not path.is_file(): raise FileNotFoundError(path)
+    display(Image(filename=str(path)))
+LOW_RAW=[x for x in EVALUATIONS if x["cell"]=="raw" and x["protocol"]=="unseen" and x["audio_domain"]=="noisy" and "snr-0-raw" in x["_path"].name]
+LOW_ERRORS=[q | {"family":x["noise_family"], "seed":x["seed"]} for x in LOW_RAW for q in x["query_predictions"] if not q["correct"]]
+SPEAKER_ALIAS={speaker:f"SPK-{i:02d}" for i,speaker in enumerate(sorted({q["speaker_id"] for r in LOW_RAW for q in r["query_predictions"]}),1)}
+SAMPLE_ALIAS={sample:f"Q-{i:03d}" for i,sample in enumerate(sorted({q["sample_id"] for r in LOW_RAW for q in r["query_predictions"]}),1)}
 ```
 
 # Abstract
 
-Hệ thống speaker recognition suy giảm mạnh khi đầu vào bị nhiễu môi trường. Nghiên
-cứu này đặt câu hỏi: một DSP front-end được *thiết kế từ dữ liệu* — thay vì theo
-quy ước — có thực sự cải thiện speaker embedding học được dưới nhiễu cộng MUSAN
-hay không. Chúng tôi suy ra các band limit của front-end từ phổ trung bình dài hạn
-đo được của speech VCTK và nhiễu MUSAN, thêm một stage adaptive notch nhắm vào các
-thành phần tonal quan sát được trong MUSAN, và áp dụng Wiener filter với ước lượng
-a-priori SNR theo luật decision-directed trong miền STFT. Một CNN speaker encoder
-được train từ đầu với mục tiêu ArcFace dưới từng cấu hình front-end, rồi đánh giá
-trên tập speaker tách biệt hoàn toàn, bằng cả identification theo enrolment lẫn
-unsupervised clustering. Các bản thu MUSAN được phân vùng **trước khi** trộn, nên
-không encoder nào bị test trên dạng sóng nhiễu mà nó đã thấy lúc train; ngoài ra
-encoder còn được đánh giá chéo với các front-end khác front-end của chính nó, trên
-lưới SNR mở rộng xuống dưới vùng train.
+Nghiên cứu này kiểm tra liệu tiền xử lý DSP **chỉ ở thời điểm suy luận** có cải thiện nhận dạng người nói của CNN đã huấn luyện kháng nhiễu hay không. Dựa hoàn toàn trên artifact `run-1`, ba checkpoint/seed được đóng băng và cùng một mixture được đi qua factorial 2×2: `raw`, `bandpass`, `wiener`, và `bandpass_wiener`. VCTK/MUSAN được partition theo recording; protocol gồm test speaker-disjoint `unseen` và closed-set `seen`. CNN dùng log-mel, ArcFace và augmentation MUSAN, nên mọi chênh lệch ở test là effect của front-end chứ không phải train lại. Trên `unseen`, raw đạt {python}`fmt(mm('raw',domain='clean'))` accuracy sạch và {python}`fmt(mm('raw'))` trung bình nhiễu; band-pass, Wiener và kết hợp đạt {python}`fmt(mm('bandpass'))`, {python}`fmt(mm('wiener'))` và {python}`fmt(mm('bandpass_wiener'))`. Bootstrap ghép cặp theo speaker cho các contrast so với raw đều có CI 95% âm. Wiener vẫn tăng SNR waveform trong positive control, nhưng gain này không chuyển thành discrimination của embedding. Với architecture, corpus và recipe đã chạy, DSP front-end cố định không cải thiện robust CNN của `run-1`.
 
-**Keywords** — digital signal processing, speaker embedding, Wiener filtering,
-spectral analysis, noise robustness, MUSAN, VCTK
+**Keywords—** speaker identification; noise robustness; speech enhancement; Wiener filtering; augmentation; factorial ablation; reproducibility.
 
 # Introduction
 
-<!-- TODO(author): nêu động cơ của speaker recognition trong điều kiện triển khai
-     có nhiễu, và phát biểu đóng góp trong 2-3 đoạn. -->
+Speaker recognition chịu ảnh hưởng của nhiễu, channel và bối cảnh thu. Các tổng quan gần đây coi robustness và protocol đánh giá là vấn đề cốt lõi [@kabir2021; @hanifa2021; @sharma2024]. Cách tiếp cận hiện đại thường học invariance qua augmentation/joint objective; nhưng enhancement đặt trước một encoder đã robust vẫn cần được ablate trên đúng cùng dữ liệu vào.
 
-# Vấn đề nghiên cứu
+Report này trả lời một câu hỏi hẹp: giữ checkpoint, mixture, enrollment, query, seed và protocol không đổi, front-end waveform ở inference làm identification thay đổi theo hướng nào? Toàn bộ evidence chỉ đến từ `runs/run-1`; report không train hoặc evaluate.
 
-Speaker embedding học được thường chỉ được đánh giá trên audio sạch hoặc
-augmentation nhẹ. Khi triển khai trên bản thu nhiễu, hiệu năng tụt, và cách khắc
-phục thông thường là thêm dữ liệu train chứ không phải cải thiện biểu diễn tín
-hiệu. Vấn đề cụ thể ở đây là: **với một speaker embedding train trên speech VCTK
-có nhiễu, những stage nào của DSP front-end thực sự khôi phục được thông tin phân
-biệt speaker, và khôi phục được bao nhiêu?**
+## Problem, objectives, RQs and hypothesis
 
-# Mục tiêu nghiên cứu
+**Vấn đề:** tăng SNR waveform không mặc nhiên bảo toàn cue phân biệt speaker. **Mục tiêu:** (i) đo raw theo SNR/family/protocol; (ii) ước lượng main effect và interaction của band-pass/Wiener; (iii) kiểm tra SNR gain có đi cùng recognition gain.
 
-1. Thiết kế một DSP front-end mà tham số được suy ra từ phổ đo được của speech và
-   nhiễu mục tiêu, thay vì giả định theo quy ước.
-2. Định lượng đóng góp của từng stage front-end vào chất lượng speaker embedding
-   trên một dải test SNR.
-3. Xác định xem có điều kiện triển khai nào biện minh được cho front-end hay
-   không, bằng cách biến thiên encoder và front-end độc lập với nhau và test ra
-   ngoài dải SNR mà encoder đã train.
+**RQ1.** Robust CNN đổi thế nào theo SNR và họ nhiễu MUSAN ở `unseen`/`seen`? **RQ2.** Band-pass, Wiener và interaction ảnh hưởng accuracy ra sao khi chỉ thay front-end? **RQ3.** SNR gain waveform có dự báo recognition gain không?
 
-# Câu hỏi nghiên cứu
+**Hypothesis kiểm định được:** không giả định DSP giúp. Với contrast ghép cặp, effect được ký hiệu Delta-B, Delta-W và Delta-BW; direction được quyết định bởi mean delta và bootstrap CI 95%.
 
-**RQ1.** Nhiễu cộng MUSAN làm suy giảm chất lượng speaker embedding như thế nào
-trên dải test SNR 0–20 dB, đo bằng cả identification accuracy lẫn mức đồng thuận
-clustering?
+# Literature review, gap and contributions
 
-**RQ2.** Những stage DSP riêng lẻ nào (band limiting, adaptive notch, STFT Wiener
-filtering) đóng góp vào việc khôi phục suy giảm đó, và các đóng góp có cộng tính
-không?
+Literature có ba dòng. **Front-end/enhancement độc lập** làm thay waveform nhưng không tối ưu trực tiếp cue speaker. **Joint enhancement/embedding** tối ưu speaker-aware: gradient alignment [@li2021] và clean–noisy embedding matching [@mohammadamini2022] báo cáo improvement ở protocol nhiễu. **Augmentation/invariance** đưa variation vào representation: VIB [@wang2021] và wav2vec fine-tuning với augmentation [@novoselov2023]. Mismatch condition còn là thách thức tại dữ liệu multi-genre và backend [@li2022cnceleb; @ferrer2022].
 
-**RQ3.** Embedding học được có vượt trội hơn biểu diễn classical DSP-only (thống
-kê MFCC và band power với cosine scoring) dưới cùng một front-end không?
-
-**RQ4.** Có tồn tại operating point nào — điều kiện train encoder × front-end lúc
-inference × test SNR, kể cả các SNR dưới dải train — mà tại đó front-end được
-thiết kế cho accuracy cao hơn so với không dùng front-end nào không?
-
-**H1.** Front-end thiết kế đầy đủ (Pipeline B) cho macro F1 cao hơn có ý nghĩa
-thống kê so với baseline raw-noisy (Pipeline A) ở test SNR thấp, kiểm định bằng
-paired test qua các seed và SNR.
-
-**H2.** Band limiting mạnh về telephone band (300–3400 Hz) làm giảm chất lượng
-embedding so với Pipeline B, vì chi tiết phân biệt speaker nằm ngoài dải tối ưu
-cho intelligibility.
-
-# Literature review
-
-<!-- TODO(author): 8-12 công bố giai đoạn 2021-2026; tối thiểu 3 journal, 3
-     conference, 2 survey. So sánh các kỹ thuật DSP giữa các bài, rồi so sánh các
-     hướng tiếp cận AI. Không liệt kê tóm tắt từng bài. Literature Matrix đặt ở
-     Phụ lục A. -->
-
-# Khoảng trống nghiên cứu
-
-<!-- TODO(author): phát biểu khoảng trống mà nghiên cứu này lấp, dựa trên phần
-     review ở trên. -->
-
-# Đóng góp kỳ vọng
-
-1. Một quy trình tái lập được, hướng dữ liệu, để chọn band limit của front-end từ
-   phổ speech và nhiễu đo được, thay vì từ quy ước.
-2. Một ablation theo từng stage, định lượng thao tác DSP nào giúp ích cho speaker
-   embedding học được, đánh giá trên speaker chưa từng thấy lúc train.
-3. Một protocol đánh giá kép kết hợp metric enrolment có giám sát với clustering
-   không giám sát trên cùng bộ embedding.
+Gap của report là inference-time ablation với cùng mixture, encoder frozen đã augmentation, seen/unseen tách rõ và paired speaker inference. Đóng góp là factorial 2×2, ba seed, bootstrap cluster theo speaker, đối chiếu SNR/recognition, error analysis từ JSON và tái lập theo config hash `{python} MANIFEST['config_hash'][:12]`.
 
 # Methodology
 
 ## Research framework
 
-```{mermaid}
-flowchart LR
-    A[Vấn đề nghiên cứu<br/>speaker embedding kháng nhiễu] --> B[Dataset<br/>VCTK 0.80 + nhiễu MUSAN]
-    B --> C[DSP preprocessing<br/>band limit, notch, Wiener]
-    C --> D[Feature extraction<br/>log-mel, MFCC, PSD, entropy]
-    D --> E[Model<br/>CNN encoder + ArcFace]
-    E --> F[Evaluation<br/>identification + clustering]
+```text
+VCTK speech + MUSAN recording partitions → train augmentation → 3 CNN/ArcFace checkpoints
+              │                                                │ freeze
+              └─ same test mixture → raw | bandpass | wiener | bandpass_wiener
+                                                                    │
+                    unseen / seen enrollment–query → metrics, paired bootstrap, errors
 ```
 
-## Dataset
+Nhánh inference chỉ thay waveform front-end; cùng seed, SNR, family và query được giữ trong contrast.
+
+## Data and protocol
+
+VCTK `wav48` và MUSAN là hai nguồn dữ liệu [@vctk; @musan]. MUSAN `noise`, `music`, `speech` được partition theo **recording trước khi cắt segment**; `babble` tổng 3–7 nguồn speech. Clip dài {python}`CONFIG['segment_seconds']` s tại {python}`CONFIG['sample_rate']` Hz.
 
 ```{python}
-# | label: dataset-table
-display(
-    table(
-        [
-            ["Speech corpus", "VCTK 0.80, 109 speaker, WAV 48 kHz"],
-            ["Noise corpus", "MUSAN, subset `noise`"],
-            ["Resample về", f"{CONFIG['sample_rate']} Hz mono"],
-            ["Độ dài clip", f"{CONFIG['segment_seconds']} s sau khi trim silence"],
-            ["Clip train / speaker", CONFIG["clips_per_speaker"]],
-            ["Clip đánh giá / speaker", CONFIG["eval_clips_per_speaker"]],
-            ["Speaker train", CONFIG["train_speakers"]],
-            ["Speaker validation", CONFIG["validation_speakers"]],
-            ["Speaker test", f"{109 - CONFIG['train_speakers'] - CONFIG['validation_speakers']} (tách biệt)"],
-            ["Bản thu nhiễu", " / ".join(f"{p['n_files']} {name}" for name, p in NOISE_SPLIT.items())],
-            ["Seeds", ", ".join(str(s) for s in CONFIG["seeds"])],
-            ["Test SNR", ", ".join(f"{s} dB" for s in CONFIG["test_snr_db"])],
-        ],
-        ["Hạng mục", "Giá trị"],
-    )
-)
+display(table(["thành phần","thiết kế run-1"], [
+ ["speaker split","60 train / 20 validation / 29 unseen test, speaker-disjoint"],
+ ["unseen","29 speaker; enrollment 10 clip/speaker, query phần còn lại"],
+ ["seen","60 speaker train, closed-set clip tách riêng; quy tắc enrollment/query như trên"],
+ ["train noise","4 family MUSAN; p(noise)=0.80; SNR liên tục 0–20 dB"],
+ ["test noise","4 family × 0, 5, 10, 15, 20 dB và clean"],
+ ["seed","11, 22, 33; mixture ghép cặp qua mọi cell"],
+]))
 ```
 
-Tập speaker tách biệt hoàn toàn giữa train, validation và test. Do đó đánh giá đo
-khả năng tổng quát hoá sang *speaker chưa từng thấy*, và đó là điều khiến
-unsupervised clustering trở thành một thước đo có ý nghĩa cho chất lượng embedding.
+`seen` dễ hơn `unseen` và không được gộp. Các mean narrative/bảng là trung bình không trọng số của evaluation report phù hợp; effect dùng unit speaker trong bootstrap artifact.
 
-Các bản thu MUSAN được phân vùng theo đúng cách đó, trước khi cắt bất kỳ segment
-nào, và có phân tầng theo sub-corpus, nên một clip test không bao giờ bị trộn với
-dạng sóng nhiễu mà encoder đã nghe lúc train. Nếu không tách như vậy, nhánh train
-có nhiễu có thể **ghi nhớ** các hiện thực nhiễu cụ thể thay vì học tính kháng
-nhiễu, và điều đó làm lệch phép so sánh theo hướng bất lợi cho mọi front-end.
+## Model, training and DSP design
 
-## DSP preprocessing
-
-Band limit được **suy ra**, không giả định. Chúng tôi đo PSD trung bình dài hạn
-của speech train và của phân vùng *train* trong noise pool MUSAN [@vctk; @musan]
-bằng phương pháp Welch [@welch1967], chuẩn hoá cả hai về cùng tổng công suất (tức
-một hỗn hợp 0 dB toàn cục), rồi chọn tần số cắt sao cho loại bỏ tối đa 1% năng
-lượng speech ở mỗi biên dải.
+CNN nhận log-mel, có convolutional blocks, attentive statistics pooling, embedding L2-normalized 192 chiều và ArcFace head [@arcface]. Mỗi seed chỉ train một lần.
 
 ```{python}
-# | label: band-table
-display(
-    table(
-        [
-            [
-                f"{int(b['low_hz'])}–{int(b['high_hz'])}",
-                f"{b['speech_power_pct']:.2f}",
-                f"{b['noise_power_pct']:.2f}",
-                f"{b['band_snr_db']:+.2f}",
-            ]
-            for b in BANDS["bands"]
-        ],
-        ["Dải (Hz)", "Công suất speech (%)", "Công suất nhiễu (%)", "Band SNR (dB)"],
-    )
-)
-cutoffs = BANDS["recommended_cutoffs"]
-display(
-    Markdown(
-        f"\nTần số cắt suy ra được: high-pass **{cutoffs['highpass_hz']} Hz**, "
-        f"low-pass **{cutoffs['lowpass_hz']} Hz**, giữ lại "
-        f"**{cutoffs['speech_energy_retained_pct']}%** năng lượng speech nhưng chỉ "
-        f"**{cutoffs['noise_energy_retained_pct']}%** năng lượng nhiễu."
-    )
-)
+display(table(["hạng mục","giá trị"], [
+ ["log-mel",f"{CONFIG['n_mels']} mel; STFT {CONFIG['n_fft']}; hop {CONFIG['hop_length']}"],
+ ["CNN / embedding",f"channels {CONFIG['cnn_channels']}; {CONFIG['embedding_dim']} chiều"],
+ ["ArcFace",f"margin={CONFIG['arcface_margin']}; scale={CONFIG['arcface_scale']}"],
+ ["optimizer",f"{CONFIG['optimizer']}; lr={CONFIG['learning_rate']}; wd={CONFIG['weight_decay']}"],
+ ["batch / epochs",f"{CONFIG['batch_size']} / {CONFIG['epochs']}"],
+ ["best validation", ", ".join(f"seed {x['seed']}: {x['best_validation_accuracy']:.4f} @ epoch {x['best_epoch']+1}" for x in TRAINING)],
+]))
+fig("training-histories.png")
 ```
 
-![Phổ trung bình dài hạn với các tần số cắt suy ra được, và tỉ số speech/nhiễu theo octave band.](outputs/dsp501-speaker-embedding-v2/reports/band-analysis.png){#fig-bands}
+Passband chỉ được suy ra từ train speech/train MUSAN: {python}`DESIGN['selected_edges_hz']['low']`–{python}`DESIGN['selected_edges_hz']['high']` Hz, Butterworth bậc {python}`CONFIG['bandpass_order']`; nó giữ {python}`DESIGN['retained_energy_pct']['speech']:.2f`% speech energy và {python}`DESIGN['retained_energy_pct']['noise']:.2f`% noise energy theo PSD. Welch PSD [@welch1967] là
 
-Bảng octave band cho thấy nhiễu MUSAN áp đảo speech cả ở dưới 125 Hz lẫn trên
-khoảng 1 kHz, trong khi speech chiếm ưu thế ở vùng 125–1000 Hz mang tần số cơ bản
-và hai formant đầu tiên.
+$$\widehat P_{xx}(f)=\frac1K\sum_{k=1}^K\frac{|\mathcal F\{w[n]x_k[n]\}|^2}{f_s\sum_nw[n]^2}.$$
 
-Ba nhóm kỹ thuật DSP trong bảng của môn học được dùng bên trong chuỗi xử lý, và
-hai nhóm nữa nằm trong feature extraction:
+Butterworth prototype có \(|H(f)|^2 = 1/[1+(f/f_c)^{2N}]\); sau đó hệ được thiết kế band-pass dạng SOS và lọc zero-phase (offline, không causal). Wiener STFT dùng Hann 512, hop 160, noise PSD từ 10% frame ít năng lượng và decision-directed gain [@ephraim1984]:
 
-| Stage | Nhóm kỹ thuật | Lý do thiết kế |
-|---|---|---|
-| High-pass Butterworth | IIR digital filtering | Loại vùng dưới 125 Hz do nhiễu chi phối, nằm dưới dải F0 của speaker. |
-| Low-pass Butterworth | IIR digital filtering | Loại dải cao do nhiễu chi phối, vẫn giữ formant F1–F3. |
-| Adaptive notch | IIR digital filtering | MUSAN chứa thành phần tonal băng hẹp (thấy rõ dưới dạng gai trong @fig-bands); các đỉnh vượt đường bao phổ cục bộ quá một ngưỡng sẽ bị notch. |
-| STFT Wiener filter | STFT / frequency analysis | Triệt nhiễu băng rộng còn lại trong mặt phẳng thời gian–tần số. |
-| Welch PSD, band power | Spectral / power | Dùng cho thiết kế filter và làm classical feature. |
-| MFCC | Cepstral | Classical baseline feature. |
-| Entropy, RMS, ZCR, spectral shape | Statistical / information | Classical baseline feature. |
+$$G_{t,f}=\max\left(g_{\min},\frac{\xi_{t,f}}{1+\xi_{t,f}}\right),\quad
+\xi_{t,f}=\alpha\frac{|\widehat S_{t-1,f}|^2}{\widehat N_f}+(1-\alpha)\max\left(\frac{|Y_{t,f}|^2}{\widehat N_f}-1,0\right).$$
 
-Tất cả filter Butterworth đều được áp dụng theo kiểu zero-phase forward–backward,
-nên đây là front-end **offline**; không đưa ra tuyên bố nào về triển khai causal
-streaming.
-
-![Đáp ứng biên độ của các filter Butterworth đã thiết kế.](outputs/dsp501-speaker-embedding-v2/reports/filter-response.png){#fig-filters}
-
-### Wiener filter
-
-Stage Wiener hoạt động trên biên độ STFT. Noise PSD $\hat{N}(f)$ được ước lượng
-bằng công suất trung bình của các frame năng lượng thấp nhất, khai thác tính thưa
-theo thời gian của speech. Với posterior SNR $\gamma = |X|^2 / \hat{N}$ và
-a-priori SNR $\xi$ thu được theo luật decision-directed [@ephraim1984]
-
-$$\xi_t = \alpha \frac{|\hat{S}_{t-1}|^2}{\hat{N}} + (1-\alpha)\max(\gamma_t - 1, 0),$$
-
-gain áp dụng là $G = \max\!\left(\frac{\xi}{1+\xi},\, G_{\min}\right)$. Sàn gain
-$G_{\min}$ hạn chế artefact musical noise sinh ra khi các bin phổ đơn lẻ bị triệt
-hoàn toàn. Nhánh `C_specsub` thay stage này bằng spectral subtraction biên độ cổ
-điển [@boll1979], để tách lợi ích của việc khử nhiễu nói chung khỏi lợi ích của
-riêng bộ ước lượng này.
-
-![Dạng sóng qua từng stage của Pipeline B.](outputs/dsp501-speaker-embedding-v2/reports/waveforms.png){#fig-waveforms}
-
-![Biên độ STFT trước và sau front-end.](outputs/dsp501-speaker-embedding-v2/reports/spectrograms.png){#fig-spectrograms}
-
-### Đặc trưng hoá front-end ở mức tín hiệu
-
-Trước khi hỏi front-end làm gì với recognition, chúng tôi đo nó làm gì với **tín
-hiệu**. Hai đại lượng được báo cáo cho mỗi nhánh: SNR của hỗn hợp đã xử lý đo so
-với tham chiếu sạch (nên nó tính cả nhiễu còn lại *lẫn* artefact xử lý), và SNR
-thu được khi chạy đúng chuỗi đó trên đầu vào **sạch**, thứ cô lập riêng phần méo
-mà chuỗi tự bơm vào. Một chuỗi trong suốt hoàn toàn sẽ đạt giá trị tuỳ ý lớn ở
-đại lượng thứ hai.
+Ở đây, \(\alpha\) lấy từ config snapshot, quantile={python}`CONFIG['wiener_noise_quantile']`, floor={python}`CONFIG['wiener_gain_floor_db']` dB. Chỉ bốn cell factorial đã nêu được phân tích trong report.
 
 ```{python}
-# | label: dsp-effect-table
-display(
-    table(
-        [
-            [
-                row["condition"],
-                " + ".join(row["stages"]) or "—",
-                f"{row['output_snr_db']:.2f}",
-                f"{row['snr_gain_db']:+.2f}",
-                f"{row['clean_path_snr_db']:.2f}",
-            ]
-            for row in DSP_EFFECT["measurements"]
-            if row["input_snr_db"] == HARDEST
-        ],
-        [
-            "Nhánh",
-            "Stages",
-            f"Output SNR khi vào {HARDEST:.0f} dB (dB)",
-            "Gain so với A (dB)",
-            "Clean-path SNR (dB)",
-        ],
-    )
-)
+display(table(["cell","band-pass","Wiener"], [["raw","không","không"],["bandpass","có","không"],["wiener","không","có"],["bandpass_wiener","có","có, sau band-pass"]]))
+fig("eda-passband.png")
 ```
 
-![Mức triệt nhiễu đạt được, đặt cạnh mức méo bơm vào speech sạch.](outputs/dsp501-speaker-embedding-v2/reports/dsp-effect.png){#fig-dsp-effect}
+## Statistical inference
 
-## Feature extraction
+Bootstrap tái lấy mẫu speaker với hoàn lại 2,000 lần; một draw giữ toàn bộ query, seed, SNR và family của speaker. Main effect là average contrast qua mức factor còn lại; interaction là (A_{11}-A_{10}-A_{01}+A_{00}). CI percentile 95% đọc từ `factorial-bootstrap.json`.
 
-Mô hình học nhận log-mel spectrogram 80 dải (`n_fft`=512, hop=160), chuẩn hoá
-mean–variance theo từng utterance. Classical baseline nhận một vector độ dài cố
-định gồm thống kê MFCC, octave band power, thống kê spectral shape và thống kê
-miền thời gian.
+# Experimental design
 
-## Thiết kế mô hình AI/ML
+Đơn vị training là seed; đơn vị causal comparison là cùng mixture/query qua cell. Endpoint chính là nearest-centroid closed-set identification accuracy. Precision macro, recall macro và macro-F1 dùng cùng prediction report. CSV có ARI/NMI nhưng report không suy diễn clustering thành identification. Integrity: run status `{python} MANIFEST['status']`, cache hash `{python} MANIFEST['data_cache_hash']`; code cell chỉ đọc artifact.
+
+# Results
+
+## Raw robustness by SNR and family
 
 ```{python}
-# | label: model-table
-display(
-    table(
-        [
-            ["Encoder", "CNN, 4 conv block với channel " + str(CONFIG["cnn_channels"])],
-            ["Pooling", "Attentive statistics (mean và standard deviation có trọng số)"],
-            ["Embedding", f"{CONFIG['embedding_dim']} chiều, chuẩn hoá L2"],
-            ["Hàm mục tiêu", f"ArcFace (margin {CONFIG['arcface_margin']}, scale {CONFIG['arcface_scale']})"],
-            ["Optimiser", CONFIG["optimizer"] + f", weight decay {CONFIG['weight_decay']}"],
-            ["Schedule", f"cosine annealing qua {CONFIG['epochs']} epoch"],
-            ["Learning rate đã chọn", TUNING["selected"]["learning_rate"]],
-            ["Batch size đã chọn", TUNING["selected"]["batch_size"]],
-        ],
-        ["Hạng mục", "Giá trị"],
-    )
-)
+display(table(["protocol","clean",*[f"{x:g} dB" for x in SNRS]], [[p,fmt(mm("raw",protocol=p,domain="clean")),*[fmt(mm("raw",protocol=p,snr=s)) for s in SNRS]] for p in ("unseen","seen")]))
+display(table(["unseen cell",*FAMILIES], [[c,*[fmt(mm(c,family=f)) for f in FAMILIES]] for c in CELLS]))
+fig("snr-curves.png")
 ```
 
-Encoder được train từ đầu chứ không fine-tune từ một speaker model lớn đã
-pretrain. Các speaker encoder pretrain công khai đều được train với noise
-augmentation rất mạnh nên bản thân chúng đã kháng nhiễu, điều này sẽ che lấp đúng
-hiệu ứng mà nghiên cứu này muốn đo. Attentive statistics pooling [@okabe2018]
-chuyển chuỗi frame độ dài thay đổi thành vector cố định, còn mục tiêu ArcFace
-[@arcface] định hình một không gian embedding trong đó khoảng cách cosine mang ý
-nghĩa trực tiếp.
+Raw `unseen` đi từ {python}`fmt(mm('raw',snr=0))` ở 0 dB đến {python}`fmt(mm('raw',snr=20))` ở 20 dB. `seen` cao hơn nhưng không gộp với unseen.
 
-# Thiết kế thực nghiệm
-
-**Biến độc lập:** cấu hình DSP front-end (8 nhánh bên dưới).
-**Biến phụ thuộc:** identification accuracy, macro precision, macro recall, macro
-F1, ARI và NMI của clustering.
-**Kiểm soát:** mọi nhánh dùng chung cùng clip nguồn, cùng segment nhiễu tất định
-cho mỗi clip, cùng SNR cho mỗi clip, cùng kiến trúc, cùng hyperparameter đã khoá,
-và cùng phân hoạch enrolment/query.
-
-| Nhánh | Nhiễu | DSP stages | Vai trò |
-|---|---|---|---|
-| `clean` | không | — | trần tham chiếu |
-| `A_raw_noisy` | có | — | **Pipeline A** (DSP tối thiểu) |
-| `B1_hpf` | có | high-pass | ablation |
-| `B2_hpf_lpf` | có | + low-pass | ablation |
-| `B3_hpf_lpf_notch` | có | + notch | ablation |
-| `B_full` | có | + Wiener | **Pipeline B** (DSP đầy đủ) |
-| `C_specsub` | có | thay Wiener bằng spectral subtraction | so sánh bộ khử nhiễu |
-| `X_telephone` | có | band-pass 300–3400 Hz | control lọc quá tay |
-
-Hyperparameter được tune một lần trên Pipeline A với seed đầu tiên rồi khoá lại
-cho mọi nhánh và mọi seed, nên không nhánh nào có lợi thế tuning.
+## Metrics by protocol, cell and seed
 
 ```{python}
-# | label: tuning-table
-display(
-    table(
-        [
-            [t["learning_rate"], t["batch_size"], f"{t['validation_accuracy']:.4f}"]
-            for t in TUNING["trials"]
-        ],
-        ["Learning rate", "Batch size", "Validation accuracy"],
-    )
-)
+rows=[]
+for p in ("unseen","seen"):
+ for c in CELLS:
+  x=report_metrics(c,p); rows.append([p,c,*[fmt(x[k]) for k in ("accuracy","precision_macro","recall_macro","f1_macro")]])
+display(table(["protocol","cell","accuracy","precision macro","recall macro","macro-F1"],rows))
+display(table(["seed (unseen noisy)",*CELLS], [[seed,*[fmt(mm(c,seed=seed)) for c in CELLS]] for seed in CONFIG["seeds"]]))
+display(table(["protocol","cell","clean accuracy","noisy accuracy"], [[p,c,fmt(mm(c,protocol=p,domain="clean")),fmt(mm(c,protocol=p))] for p in ("unseen","seen") for c in CELLS]))
 ```
 
-## Protocol đánh giá
+Raw dẫn đầu ở từng seed và cả hai protocol. Tại `unseen`, delta mean so raw của bandpass, Wiener và combined lần lượt là {python}`fmt(mm('bandpass')-mm('raw'))`, {python}`fmt(mm('wiener')-mm('raw'))`, {python}`fmt(mm('bandpass_wiener')-mm('raw'))` accuracy point.
 
-Identification dùng protocol enrolment: với mỗi speaker được đánh giá,
-`enrollment_clips` clip đầu tạo thành tập enrolment và phần còn lại là query,
-chấm điểm bằng cosine nearest centroid và bằng một linear SVM trên cùng bộ
-embedding. Clustering dùng agglomerative clustering với số speaker thật (cho ARI/
-NMI so sánh trực tiếp được giữa các nhánh) và HDBSCAN với số cụm chưa biết (cho
-tỉ lệ outlier phản ánh độ nén của embedding).
-
-Cùng protocol đó được áp lên hai quần thể speaker:
-
-| Protocol | Quần thể | Đo cái gì |
-|---|---|---|
-| **Closed set** (`seen`) | *Câu nói* giữ lại của 60 speaker train | Identification giữa các speaker mà encoder đã được fit. |
-| **Open set** (`unseen`) | 29 speaker hoàn toàn vắng mặt lúc train | Encoder có học được khái niệm speaker chuyển giao được hay không. |
-
-Vì cơ chế enrolment giống hệt nhau, khoảng cách giữa hai giá trị là phép đo trực
-tiếp cho phần điểm số đến từ việc fit riêng speaker thay vì từ một biểu diễn tổng
-quát hoá được. Trừ khi nói khác đi, mọi kết quả bên dưới dùng protocol open-set,
-vốn khó hơn và nhiều thông tin hơn.
-
-# Kết quả thực nghiệm
+## Paired factorial effects
 
 ```{python}
-# | label: results-table
-conditions = [
-    "clean", "A_raw_noisy", "B1_hpf", "B2_hpf_lpf",
-    "B3_hpf_lpf_notch", "B_full", "C_specsub", "X_telephone",
-]
-rows = []
-for condition in conditions:
-    accuracy = mean_by(condition, "accuracy")
-    if accuracy is None:
-        continue
-    rows.append(
-        [
-            condition,
-            f"{accuracy:.4f}",
-            f"{mean_by(condition, 'precision_macro'):.4f}",
-            f"{mean_by(condition, 'recall_macro'):.4f}",
-            f"{mean_by(condition, 'f1_macro'):.4f}",
-            f"{mean_by(condition, 'agglomerative_ari'):.4f}",
-            f"{mean_by(condition, 'agglomerative_nmi'):.4f}",
-        ]
-    )
-display(table(rows, ["Nhánh", "Accuracy", "Precision", "Recall", "F1", "ARI", "NMI"]))
-display(Markdown("\nProtocol open-set; trung bình qua các seed và test SNR. Càng cao càng tốt ở mọi cột."))
+label={"bandpass_main":"main: band-pass","wiener_main":"main: Wiener","bandpass_x_wiener":"interaction B×W","bandpass_minus_raw":"bandpass − raw","wiener_minus_raw":"Wiener − raw","bandpass_wiener_minus_raw":"B+W − raw"}
+rows=[]
+for p in ("unseen","seen"):
+ for e,r in FACTORIAL[p]["accuracy"].items(): rows.append([p,label[e],r["n_speakers"],fmt(r["mean_delta"],4),f"[{r['ci_low']:.4f}, {r['ci_high']:.4f}]"])
+display(table(["protocol","contrast","speaker","mean Δ accuracy","bootstrap 95% CI"],rows)); fig("factorial-effects.png")
 ```
 
-![Chất lượng embedding theo test SNR.](outputs/dsp501-speaker-embedding-v2/reports/snr-curves.png){#fig-snr}
+Toàn bộ CI main effect và cell-vs-raw âm. Interaction `unseen` cũng âm: {python}`fmt(FACTORIAL['unseen']['accuracy']['bandpass_x_wiener']['mean_delta'],4)`, 95% CI [{python}`fmt(FACTORIAL['unseen']['accuracy']['bandpass_x_wiener']['ci_low'],4)`, {python}`fmt(FACTORIAL['unseen']['accuracy']['bandpass_x_wiener']['ci_high'],4)`].
 
-![Ablation theo từng stage.](outputs/dsp501-speaker-embedding-v2/reports/ablation-f1.png){#fig-ablation}
+# Error analysis
 
-![Confusion matrix chuẩn hoá theo hàng, tại test SNR khó nhất.](outputs/dsp501-speaker-embedding-v2/reports/confusion-matrices.png){#fig-confusion}
-
-## Closed set so với open set
-
-Cùng encoder, cùng cách xử lý audio và cùng cơ chế enrolment, áp lên speaker mà
-encoder đã train so với speaker nó chưa từng nghe.
+Phân tích chỉ dùng `raw` + `unseen` + noisy + 0 dB, điều kiện khó nhất. Một error là một query/seed/family trong JSON đã lưu. Speaker và query được ánh xạ xác định sang ID giả danh `SPK-##` và `Q-###`; report không hiển thị audio, transcript hay đường dẫn nguồn.
 
 ```{python}
-# | label: protocol-table
-rows = []
-for condition in ("clean", "A_raw_noisy", "B_full"):
-    seen = mean_by(condition, "accuracy", protocol="seen")
-    unseen = mean_by(condition, "accuracy", protocol="unseen")
-    if seen is None or unseen is None:
-        continue
-    rows.append(
-        [condition, f"{seen:.4f}", f"{unseen:.4f}", f"{seen - unseen:+.4f}"]
-    )
-display(
-    table(
-        rows,
-        ["Nhánh", "Closed set (speaker đã thấy)", "Open set (speaker chưa thấy)", "Chênh lệch"],
-    )
-)
+bad=Counter(x["family"] for x in LOW_ERRORS); total=Counter(r["noise_family"] for r in LOW_RAW for x in r["query_predictions"])
+display(table(["family","errors","queries","error rate"],[[f,bad[f],total[f],fmt(bad[f]/total[f])] for f in FAMILIES]))
+stat=defaultdict(lambda:[0,0])
+for r in LOW_RAW:
+ for q in r["query_predictions"]: stat[q["speaker_id"]][0]+=int(not q["correct"]); stat[q["speaker_id"]][1]+=1
+hard=sorted(stat.items(),key=lambda x:(x[1][0]/x[1][1],x[1][0]),reverse=True)[:8]
+display(table(["speaker","errors","queries","error rate"],[[SPEAKER_ALIAS[s],b,n,fmt(b/n)] for s,(b,n) in hard]))
+pairs=Counter((x["true_speaker"],x["predicted_speaker"]) for x in LOW_ERRORS)
+display(table(["true → predicted","count"],[[f"{SPEAKER_ALIAS[a]} → {SPEAKER_ALIAS[b]}",n] for (a,b),n in pairs.most_common(8)]))
+chosen=sorted(LOW_ERRORS,key=lambda x:(-float(x["score"]),x["sample_id"]))[:8]
+display(table(["sample ID","family","true","predicted","cosine score"],[[SAMPLE_ALIAS[x["sample_id"]],x["family"],SPEAKER_ALIAS[x["true_speaker"]],SPEAKER_ALIAS[x["predicted_speaker"]],fmt(float(x["score"]))] for x in chosen]))
 ```
 
-![Closed set đối chiếu open set trên lưới SNR.](outputs/dsp501-speaker-embedding-v2/reports/protocol-comparison.png){#fig-protocol}
-
-<!-- TODO(author): diễn giải khoảng chênh. Chênh lớn nghĩa là encoder đang fit
-     theo speaker train chứ không học được biểu diễn chuyển giao được, đây là hệ
-     quả dự kiến khi chỉ train trên 60 speaker. Nêu rõ thứ hạng DSP có giống nhau
-     dưới cả hai protocol không; nếu giống, kết luận về front-end không phụ thuộc
-     vào lựa chọn protocol. -->
-
-## Front-end phải chứng minh giá trị ở đâu
-
-Các kết quả ở trên là *matched*: mỗi encoder chỉ nhìn thấy audio do chính front-end
-của nó tạo ra, ở đúng dải SNR nó đã train. Đó là điều kiện ít thuận lợi nhất cho
-một front-end, vì encoder đã kịp thích nghi với mọi thứ front-end làm. Đó cũng
-không phải điều kiện mà front-end sinh ra để phục vụ. Front-end được kỳ vọng có
-lãi khi điều kiện inference tệ hơn bất cứ thứ gì từng thấy lúc train, và khi
-encoder không thể train lại.
-
-Vì vậy chúng tôi biến thiên encoder và front-end **độc lập** với nhau, đồng thời
-mở rộng lưới SNR xuống dưới dải train. Cột `no noise` không có trục SNR: nó đo
-điều gì xảy ra khi audio hoàn toàn sạch.
-
-```{python}
-# | label: cross-eval-table
-if CROSS_EVAL:
-    grid = sorted({r["test_snr_db"] for r in CROSS_EVAL if r["test_snr_db"] is not None})
-    levels = ([None] if any(r["test_snr_db"] is None for r in CROSS_EVAL) else []) + grid
-    rows = []
-    for encoder in CONFIG["cross_eval_encoders"]:
-        for frontend in CONFIG["cross_eval_frontends"]:
-            cells = [fmt(cross(encoder, frontend, level)) for level in levels]
-            if all(cell == "—" for cell in cells):
-                continue
-            rows.append([encoder, FRONTEND_LABEL.get(frontend, frontend), *cells])
-    header = ["Encoder", "Front-end"] + [
-        "clean" if level is None else f"{level:.0f} dB" for level in levels
-    ]
-    display(table(rows, header))
-    display(
-        Markdown(
-            "\nAccuracy open-set, trung bình qua các seed. Dải SNR lúc train là "
-            f"{min(CONFIG['train_snr_db'])}–{max(CONFIG['train_snr_db'])} dB; "
-            "các cột nằm ngoài dải đó là out-of-distribution."
-        )
-    )
-```
-
-![Lợi ích của front-end theo mức lệch train/inference. Vùng tô xám là dải SNR lúc train.](outputs/dsp501-speaker-embedding-v2/reports/generalisation-matrix.png){#fig-generalisation}
-
-Bảng trên trả lời RQ4 trực tiếp. Đọc theo cột: với một encoder cho trước, việc
-thêm front-end lúc inference hầu như không nâng được accuracy. Đọc theo hàng: lợi
-thế của front-end **không** lớn dần khi test SNR tụt xuống dưới dải train. Và quan
-trọng nhất, ô tốt nhất ở mọi mức SNR đều thuộc về cặp không-DSP.
-
-Ngoại lệ duy nhất đáng ghi nhận là encoder `B_full`: nó chạy tốt hơn khi được cho
-ăn audio đã qua DSP, ở các mức SNR thấp. Nhưng đó là hiệu ứng **matched-condition**
-— mọi mô hình đều tốt hơn khi đầu vào giống phân bố lúc train — chứ không phải
-bằng chứng cho thấy front-end khử nhiễu hiệu quả. Mức tuyệt đối của nó vẫn thấp
-hơn cặp không-DSP.
-
-## Cái giá và lợi ích của việc train trên nhiễu
-
-Cột `no noise` cho phép tách hai thứ mà accuracy thường gộp lẫn: liệu train trên
-nhiễu là một **augmentation** thật sự (giúp cả trên audio sạch), hay chỉ là
-**domain matching** (chỉ giúp khi điều kiện test khớp lúc train).
-
-```{python}
-# | label: augmentation-table
-if CROSS_EVAL:
-    rows = []
-    for encoder in CONFIG["cross_eval_encoders"]:
-        clean_cell = cross(encoder, "clean", None)
-        noisy_cell = cross(encoder, "A_raw_noisy", 0.0)
-        if clean_cell is None and noisy_cell is None:
-            continue
-        baseline_clean = cross("clean", "clean", None)
-        baseline_noisy = cross("clean", "A_raw_noisy", 0.0)
-        rows.append(
-            [
-                encoder,
-                fmt(clean_cell),
-                fmt(None if clean_cell is None or baseline_clean is None else clean_cell - baseline_clean, sign=True),
-                fmt(noisy_cell),
-                fmt(None if noisy_cell is None or baseline_noisy is None else noisy_cell - baseline_noisy, sign=True),
-            ]
-        )
-    display(
-        table(
-            rows,
-            [
-                "Encoder train trên",
-                "Audio sạch",
-                "so với encoder `clean`",
-                "Audio nhiễu 0 dB",
-                "so với encoder `clean`",
-            ],
-        )
-    )
-```
-
-<!-- TODO(author): phát biểu kết luận từ bảng này. Nếu encoder train trên nhiễu
-     đạt thấp hơn encoder `clean` trên audio sạch, thì nhiễu KHÔNG phải một
-     regulariser miễn phí; nó là một đánh đổi. Nêu rõ tỉ giá của đánh đổi đó
-     (mất bao nhiêu trên audio sạch, được bao nhiêu trên audio nhiễu) và so tỉ
-     giá đó với tỉ giá của DSP front-end. -->
-
-## Kiểm tra không cần model: thông tin còn ở đó không?
-
-Accuracy gộp lẫn hai điều mà một front-end có thể gây ra: **phá huỷ** thông tin
-speaker, hoặc chỉ **trình bày lại** thông tin đó dưới dạng mà encoder chưa được
-fit. Để tách hai điều này, chúng tôi đo khả năng phân biệt speaker mà hoàn toàn
-không dùng model, bằng Fisher ratio (độ tán giữa speaker chia cho độ tán trong
-cùng speaker) trong một không gian thống kê MFCC cố định, trên cùng các clip ở
-cùng các mức SNR.
-
-```{python}
-# | label: discriminability-table
-if DISCRIMINABILITY:
-    display(
-        table(
-            [
-                [
-                    row["condition"],
-                    " + ".join(row["stages"]) or "—",
-                    f"{row['fisher_ratio']:.4f}",
-                    f"{row['between_speaker_scatter']:.3f}",
-                    f"{row['within_speaker_scatter']:.3f}",
-                ]
-                for row in DISCRIMINABILITY["measurements"]
-                if row["input_snr_db"] == HARDEST
-            ],
-            [
-                "Nhánh",
-                "Stages",
-                f"Fisher ratio tại {HARDEST:.0f} dB",
-                "Giữa speaker",
-                "Trong speaker",
-            ],
-        )
-    )
-    display(
-        Markdown(
-            f"\nTính trên {DISCRIMINABILITY['n_clips']} clip open-set, chuẩn hoá "
-            "theo từng chiều đặc trưng để tỉ số so sánh được giữa các nhánh có "
-            "thay đổi thang đo tổng thể của đặc trưng."
-        )
-    )
-```
-
-## So sánh baseline: embedding học được và classical DSP-only feature
-
-```{python}
-# | label: dsponly-table
-rows = []
-for condition in ("A_raw_noisy", "B_full"):
-    for model, label in (("cnn", "CNN embedding"), ("dsp_only", "DSP-only feature")):
-        accuracy = mean_by(condition, "accuracy", model)
-        if accuracy is not None:
-            rows.append(
-                [condition, label, f"{accuracy:.4f}", f"{mean_by(condition, 'f1_macro', model):.4f}"]
-            )
-display(table(rows, ["Nhánh", "Biểu diễn", "Accuracy", "F1"]))
-```
-
-## Ý nghĩa thống kê
-
-```{python}
-# | label: significance-table
-display(
-    table(
-        [
-            [
-                s["metric"],
-                s.get("protocol", "unseen"),
-                s["comparison"],
-                s["n_pairs"],
-                f"{s['mean_difference']:+.4f}",
-                f"[{s['ci_low']:+.4f}, {s['ci_high']:+.4f}]",
-                f"{s['t_p_value']:.4g}",
-                f"{s['wilcoxon_p_value']:.4g}",
-            ]
-            for s in SIGNIFICANCE
-        ],
-        [
-            "Metric",
-            "Protocol",
-            "So sánh",
-            "n",
-            "Chênh lệch TB",
-            "KTC 95%",
-            "t-test p",
-            "Wilcoxon p",
-        ],
-    )
-)
-```
-
-# Phân tích lỗi
-
-```{python}
-# | label: error-analysis
-seed = CONFIG["seeds"][0]
-hardest_snr = int(min(CONFIG["test_snr_db"]))
-for condition in ("A_raw_noisy", "B_full"):
-    path = STUDY_ROOT / f"seed-{seed}" / condition / f"evaluation-snr-{hardest_snr}.json"
-    if not path.is_file():
-        continue
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    display(
-        Markdown(
-            f"\n**{condition} tại {hardest_snr} dB — các cặp speaker bị nhầm nhiều nhất**\n"
-        )
-    )
-    display(
-        table(
-            [[c["true_speaker"], c["predicted_speaker"], c["count"]] for c in payload["confusable_speakers"][:8]],
-            ["Speaker thật", "Bị đoán thành", "Số lỗi"],
-        )
-    )
-    display(
-        Markdown(
-            f"\nCác lỗi tự tin nhất (score margin lớn nhất) trong tổng số "
-            f"{len(payload['errors'])} lỗi được ghi nhận:\n"
-        )
-    )
-    display(
-        table(
-            [
-                [e["sample_id"], e["true_speaker"], e["predicted_speaker"], f"{e['margin']:.3f}"]
-                for e in payload["errors"][:5]
-            ],
-            ["Clip", "Thật", "Đoán", "Score margin"],
-        )
-    )
-```
-
-<!-- TODO(author): diễn giải các lỗi. Nhầm lẫn có tập trung ở các cặp cùng giới
-     tính không? Ở các speaker nói nhỏ không? Artefact của Wiener có tạo ra kiểu
-     hỏng mới ở SNR thấp không? -->
+“Confidence” là cosine score predicted-centroid, không phải probability đã calibration. Quy tắc chọn mẫu là filter context trên, sort score giảm dần rồi sample ID nên tái tạo được. Các bảng mô tả decision, không suy ra nguyên nhân phonetic/demographic vì artifact không có annotation đó.
 
 # Discussion
 
-## Vì sao kết quả lại như vậy
+**RQ1:** raw suy giảm ở low SNR và seen cao hơn unseen; protocol không thể thay thế nhau. Generalization thực tế còn chịu genre/channel mismatch [@li2022cnceleb; @ferrer2022]. **RQ2:** evidence bác bỏ direction cải thiện của ba front-end cố định: raw dẫn đầu, CI paired âm và interaction âm. Điều này không mâu thuẫn với joint/invariance papers vì chúng tối ưu representation cùng noise [@li2021; @mohammadamini2022; @wang2021], còn encoder ở đây frozen. **RQ3:** Wiener positive control tăng SNR nhưng trade-off MUSAN không cho recognition gain. Suy luận hợp lý là processing thay đổi spectral-temporal cue encoder dùng; đây là diễn giải, không phải đo causal từng cue. Augmentation được khuyến nghị trong hệ wav2vec robust [@novoselov2023].
 
-Bằng chứng then chốt là @fig-dsp-effect đọc cùng với @fig-ablation. Front-end
-**có** triệt nhiễu đúng như thiết kế, nhưng đó không phải thứ quyết định kết quả
-recognition; thứ quyết định là phần méo nó bơm vào chính speech.
+## Signal positive control
 
-**Sàn méo.** Cho tín hiệu *sạch* chạy qua chuỗi `B_full` rồi đo SNR còn lại so với
-bản gốc chỉ được `{python} fmt(effect("B_full", HARDEST, "clean_path_snr_db"), 2)` dB.
-Đó là một sàn cứng: output SNR không thể vượt quá mức đó dù đầu vào có sạch đến
-đâu. Hệ quả trực tiếp là gain của chuỗi đảo dấu theo input SNR — tại
-`{python} f"{HARDEST:.0f}"` dB gain là
-`{python} fmt(effect("B_full", HARDEST, "snr_gain_db"), 2, sign=True)` dB, nhưng tại
-`{python} f"{EASIEST:.0f}"` dB nó tụt xuống
-`{python} fmt(effect("B_full", EASIEST, "snr_gain_db"), 2, sign=True)` dB. Nói cách
-khác, front-end chỉ có lãi ở phần thấp của lưới SNR, còn trên phần cao nó lỗ, và
-trung bình trên toàn lưới thì lỗ.
+```{python}
+display(table(["input SNR (dB)","before","after","gain (dB)"],[[fmt(x["input_snr_db"],1),fmt(x["before_snr_db"],2),fmt(x["after_snr_db"],2),fmt(x["snr_gain_db"],2)] for x in POSITIVE["measurements"]])); fig("snr-recognition-tradeoff.png")
+```
 
-**Thang ablation.** Đi từng nấc trên @fig-ablation cho thấy chi phí không phân bố
-đều. High-pass gần như miễn phí — nó chỉ cắt vùng dưới F0 nơi nhiễu áp đảo. Low-pass
-và notch tốn ít. Riêng stage Wiener chịu trách nhiệm cho phần lớn tổn thất. Điều
-này khớp với bảng đặc trưng hoá: Wiener là stage duy nhất có gain phụ thuộc mạnh
-vào tín hiệu và biến thiên theo từng frame, nên nó bóp méo đường bao phổ khác nhau
-ở từng clip.
-
-**Vì sao band limiting lại đắt.** Các hàng 4–8 kHz trong bảng octave band mang rất
-ít năng lượng, nên một filter thiết kế theo tiêu chí năng lượng sẽ vứt chúng đi
-gần như không do dự. Nhưng một encoder train trên chính dữ liệu nhiễu đó có thể
-khai thác chi tiết phổ ở vùng năng lượng thấp mà một filter cố định buộc phải loại
-bỏ. Đây là bất đối xứng cốt lõi: tiêu chí năng lượng và tiêu chí thông tin phân
-biệt speaker không trùng nhau.
-
-**Nghịch lý Fisher.** Bảng model-free ở trên xếp `B_full`
-(`{python} fmt(fisher("B_full", HARDEST))`) **cao hơn** `A_raw_noisy`
-(`{python} fmt(fisher("A_raw_noisy", HARDEST))`) về khả năng phân biệt speaker
-tuyến tính trong không gian MFCC, trong khi accuracy thì ngược lại. Suy ra tổn
-thất **không** thể quy cho việc thông tin bị phá huỷ hoàn toàn. Nó phải được quy
-cho biểu diễn mà encoder có thể khai thác: thứ CNN dùng không phải là thứ mà một
-thống kê tuyến tính trên trung bình/độ lệch MFCC nhìn thấy được. Đây là mức khẳng
-định tối đa mà phép đo này cho phép; nó chưa xác định được cơ chế cụ thể.
-
-<!-- TODO(author): bổ sung (nếu muốn) diễn giải khoảng chênh closed/open set ở
-     @fig-protocol: hình phạt do chuỗi DSP gây ra trên speaker đã thấy nhỏ hơn
-     đáng kể so với trên speaker chưa thấy, gợi ý front-end phá thông tin speaker
-     chuyển giao được nhiều hơn là phá đầu mối riêng của từng speaker. -->
-
-## Điểm mạnh
-
-Bốn điểm phân biệt thiết kế này với một so sánh thông thường:
-
-1. **Tần số cắt được suy ra, không giả định.** Chúng đến từ phổ đo được của đúng
-   speech và đúng nhiễu dùng trong thí nghiệm, và quy trình này tái lập được.
-2. **Cơ chế kiểm chứng được, không suy đoán.** Việc đặc trưng hoá ở mức tín hiệu
-   (gain đối chiếu clean-path SNR) cho phép giải thích *vì sao* nhánh DSP thua,
-   thay vì chỉ ghi nhận là nó thua.
-3. **Protocol kép tách fitting khỏi generalisation.** Cùng cơ chế enrolment áp lên
-   speaker đã thấy và chưa thấy, nên khoảng chênh là một phép đo chứ không phải
-   một phỏng đoán.
-4. **Nhiễu được phân vùng theo bản thu.** Tính kháng nhiễu học được không thể là
-   ghi nhớ nhiễu test. Đây là phản biện hiển nhiên nhất đối với một kết quả âm,
-   và nó đã bị loại trừ bằng thực nghiệm.
-
-<!-- TODO(author): đối chiếu thêm với literature sau khi hoàn thành phần review. -->
-
-## Điểm yếu và hạn chế
-
-<!-- TODO(author): filter zero-phase là non-causal; chỉ một corpus; chỉ nhiễu
-     cộng, không có reverberation hay hiệu ứng kênh; chỉ một kiến trúc;
-     noise PSD được ước lượng từ các frame yên nhất của clip 2 s, nên bị
-     ước lượng thừa khi speech liên tục — đây là nguyên nhân khả dĩ nhất khiến
-     stage Wiener triệt quá tay;
-     109 speaker là ít để học một speaker embedding chuyển giao được, nên các con
-     số open-set thấp hơn năng lực thật của một hệ thống quy mô corpus. -->
+Positive control là kiểm tra implementation tín hiệu, không phải evidence recognition.
 
 # Threats to validity
 
-**Internal.** Hyperparameter chỉ được tune trên Pipeline A rồi khoá, nên Pipeline B
-không được tune theo hướng có lợi cho chính nó; ngược lại Pipeline A có thể giữ
-một lợi thế nhỏ. Segment nhiễu, SNR, vị trí crop và phân hoạch enrolment đều là
-hàm tất định của danh tính clip, nên mọi nhánh gặp cùng độ khó. Các bản thu MUSAN
-được chia thành ba nhóm train, validation và test rời nhau trước khi cắt bất kỳ
-segment nào, loại bỏ khả năng nhánh train-trên-nhiễu đạt điểm cao nhờ đã ghi nhớ
-đúng những dạng sóng nhiễu dùng lúc test.
+**Internal:** paired mixture/bootstrap giảm sampling confound nhưng chỉ có ba training seed; zero-phase filter là offline. **External:** VCTK/MUSAN, 2 s và CNN từ scratch không đại diện mọi ngôn ngữ, mic, reverb, codec hay SSL encoder. **Construct:** metric là closed-set identification, SNR là waveform metric, cosine “confidence” không calibration; Gaussian positive control không đại diện noise non-stationary.
 
-**External.** Kết quả mô tả speech đọc của VCTK, subset nhiễu MUSAN, cách trộn
-cộng, và một kiến trúc encoder. Chúng không tự động chuyển sang điều kiện
-reverberant, far-field, đa ngôn ngữ hay có spoofing.
+# Conclusion
 
-**Construct.** Identification accuracy trên speaker chưa thấy đã enrol và mức đồng
-thuận clustering đo hai khía cạnh khác nhau của chất lượng embedding; cả hai đều
-được báo cáo vì không cái nào một mình là proxy đầy đủ cho "lượng thông tin speaker
-còn được giữ lại".
+Trong `run-1`, DSP ở inference không cải thiện robust CNN: raw `unseen` noisy {python}`fmt(mm('raw'))` cao hơn bandpass {python}`fmt(mm('bandpass'))`, Wiener {python}`fmt(mm('wiener'))` và combined {python}`fmt(mm('bandpass_wiener'))`; paired CI chính đều âm. Trong phạm vi run này, giữ raw waveform là lựa chọn được evidence hỗ trợ.
 
-<!-- TODO(author): nêu biện pháp giảm thiểu cho từng threat. -->
+# Future work
 
-# Kết luận
+Hướng tiếp theo: joint/end-to-end front-end training, cross-corpus/channel/reverb, verification/calibration/open-set metric, nhiều seed hơn và learned enhancement speaker-aware. Đây là đề xuất, không phải kết quả đã chạy.
 
-<!-- TODO(author): trả lời RQ1-RQ4 và phát biểu phán quyết cho từng giả thuyết
-     một cách tường minh. Cả H1 lẫn H2 đều bị các phép đo trong @fig-ablation bác
-     bỏ, nên hãy nói thẳng thay vì làm nhẹ đi; một giả thuyết bị bác bỏ kèm cơ
-     chế đo được là một kết quả, không phải một thất bại. -->
+# Ethics statement
 
-# Hướng phát triển
+Nghiên cứu dùng public VCTK/MUSAN [@vctk; @musan]. Speaker recognition là biometric và có rủi ro privacy, surveillance, consent và disparate error. Report không công bố audio/transcript/path; ví dụ lỗi chỉ dùng ID pseudonymized. Sử dụng ngoài nghiên cứu phải kiểm tra license, consent, governance, bias và human oversight.
 
-<!-- TODO(author): biến thể causal/streaming, learned front-end, điều kiện
-     reverberant, đánh giá cross-corpus. Ứng viên mạnh nhất: mở rộng dải SNR của
-     augmentation thay vì thêm DSP stage, vì bảng đánh đổi cho thấy tỉ giá của
-     augmentation tốt hơn hẳn. -->
+# Reproducibility
 
-# Tuyên bố đạo đức
-
-VCTK và MUSAN là corpus nghiên cứu công khai, được dùng theo giấy phép đã công bố
-và có trích dẫn tương ứng. Không có dữ liệu người mới nào được thu, nên không cần
-thủ tục xin đồng thuận. Các corpus chứa giọng nói định danh được; không có nỗ lực
-nào nhằm liên kết speaker với danh tính thật, và không có audio thô nào được phân
-phối lại kèm gói này. Speaker recognition là công nghệ sinh trắc học có tiềm năng
-bị dùng cho giám sát; nghiên cứu này chỉ đánh giá tính kháng nhiễu và không cung
-cấp dịch vụ định danh.
-
-<!-- TODO(author): đối chiếu lại câu chữ về giấy phép với văn bản licence của các
-     corpus. -->
-
-# Khả năng tái lập
+Report chỉ đọc `outputs/dsp501-frozen-cnn-factorial/runs/run-1`: config/manifest, checkpoints, CSV/JSON và figures. Render không chạy experiment:
 
 ```bash
-uv sync
-# đặt VCTK 0.80 vào dataset/VCTK-Corpus-0.80 và MUSAN vào dataset/musan
-uv run python run.py all --config configs/dsp501-v2.json
-uv run pytest -q
+cd /home/truong51972/projects/dsp
 QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
 ```
 
-Seed, môi trường phần mềm và mọi tham số thí nghiệm đều được ghi trong
-`configs/dsp501-v2.json`, `requirements.txt`, và các file `training-history.json`
-của từng run.
+Code đầu report kiểm tra artifact; figure path là `run-1`; bibliography dùng CSL IEEE cục bộ `ieee.csl`. Không gọi `run.py`, train hoặc evaluate.
 
-# Phụ lục A — Literature matrix
+# Appendix A: Literature matrix
 
-<!-- TODO(author): mỗi bài một hàng.
+| Paper | loại nguồn | DSP/enhancement | model/training | data/protocol | finding | limitation | liên hệ |
+|---|---|---|---|---|---|---|---|
+| Li *et al.* [@li2021] | conference | gradient alignment | joint clean/noisy | VoxCeleb1; seen/unseen | robust hơn baseline | không inference-only | invariance học được |
+| Wang *et al.* [@wang2021] | conference | VIB | VovNet + regularization | noisy SR | EER giảm | khác architecture | suppress nuisance |
+| MohammadAmini *et al.* [@mohammadamini2022] | conference | clean/noisy matching | ResNet joint loss | noise + reverb | embedding robust hơn | không frozen DSP | đối chứng joint |
+| Novoselov *et al.* [@novoselov2023] | conference | augmentation | wav2vec fine-tuning | multi-domain SV | khuyến nghị augmentation | không paired 2×2 | robust recipe |
+| Hanifa *et al.* [@hanifa2021] | journal review | tổng quan | nhiều model | survey | taxonomy/challenge | scope rộng | nền tảng |
+| Kabir *et al.* [@kabir2021] | journal survey | tổng quan | nhiều model | survey | theory/method/opportunity | scope rộng | thuật ngữ |
+| Sharma *et al.* [@sharma2024] | journal review | tổng quan | lịch sử SR | survey | milestones | chọn lọc lịch sử | bối cảnh |
+| Li *et al.* [@li2022cnceleb] | journal/data study | không | i/x-vector, MG training | CN-Celeb | mismatch khó | khác corpus | hạn chế generalization |
+| Ferrer *et al.* [@ferrer2022] | journal | condition-aware calibration | PLDA-like backend | held-out conditions | robust backend | verification | discrimination ≠ calibration |
 
-| Paper | DSP technique | AI model | Dataset | Key findings | Research gap | Limitations |
-|---|---|---|---|---|---|---|
--->
+Các nguồn 2021–2024 gồm 5 journal/review và 4 conference; DOI, venue, năm được đối chiếu publisher/venue gốc.
 
-# Phụ lục B — AI declaration
+# Appendix B: AI declaration (mẫu để nhóm hoàn tất)
 
-<!-- TODO(author): điền theo template của đề bài.
-
-| Item | Description |
-|---|---|
-| AI tool | |
-| Purpose | |
-| Stage used | |
-| Human verification | |
-| Final responsibility statement | |
--->
+**Công cụ AI:** `[điền tên/phiên bản/ngày]`. **Phạm vi:** `[ví dụ: hỗ trợ diễn đạt/cấu trúc; không tạo số liệu]`. **Kiểm chứng:** `[người kiểm tra]` đã đối chiếu số, citation, diễn giải và render với `run-1` vào `[ngày]`. **Trách nhiệm:** nhóm tác giả chịu trách nhiệm cuối cùng về nội dung, kết quả, license/dữ liệu và quyết định nghiên cứu.
 
 # References

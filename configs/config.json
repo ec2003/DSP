@@ -1,0 +1,106 @@
+{
+  "study_id": "dsp501-frozen-cnn-factorial",
+  "vctk_root": "dataset/VCTK-Corpus-0.80/wav48",
+  "musan_root": "dataset/musan",
+  "output_root": "outputs",
+  "sample_rate": 16000,
+  "segment_seconds": 2.0,
+  "clips_per_speaker": 140,
+  "eval_clips_per_speaker": 50,
+  "train_speakers": 60,
+  "validation_speakers": 20,
+  "seeds": [
+    11,
+    22,
+    33
+  ],
+  "conditions": {
+    "raw": {
+      "stages": []
+    },
+    "bandpass": {
+      "stages": [
+        "bandpass"
+      ]
+    },
+    "wiener": {
+      "stages": [
+        "wiener"
+      ]
+    },
+    "bandpass_wiener": {
+      "stages": [
+        "bandpass",
+        "wiener"
+      ]
+    }
+  },
+  "train_snr_range_db": [
+    0.0,
+    20.0
+  ],
+  "test_snr_db": [
+    0.0,
+    5.0,
+    10.0,
+    15.0,
+    20.0
+  ],
+  "noise_pool_size": 2000,
+  "noise_split_fractions": [
+    0.60,
+    0.15,
+    0.25
+  ],
+  "p_noise": 0.80,
+  "train_noise_families": [
+    "noise",
+    "music",
+    "speech",
+    "babble"
+  ],
+  "test_noise_families": [
+    "noise",
+    "music",
+    "speech",
+    "babble"
+  ],
+  "babble_sources_range": [
+    3,
+    7
+  ],
+  "band_speech_energy_margin": 0.01,
+  "bandpass_order": 4,
+  "n_fft": 512,
+  "hop_length": 160,
+  "n_mels": 80,
+  "notch_enabled": false,
+  "notch_max_peaks": 2,
+  "notch_prominence_db": 8.0,
+  "notch_quality": 30.0,
+  "wiener_noise_quantile": 0.10,
+  "wiener_alpha": 0.98,
+  "wiener_gain_floor_db": -18.0,
+  "positive_control_snr_db": [
+    0.0,
+    5.0
+  ],
+  "embedding_dim": 192,
+  "cnn_channels": [
+    32,
+    64,
+    128,
+    256
+  ],
+  "arcface_margin": 0.2,
+  "arcface_scale": 30.0,
+  "learning_rate": 0.001,
+  "batch_size": 64,
+  "epochs": 18,
+  "weight_decay": 0.00002,
+  "optimizer": "adamw",
+  "enrollment_clips": 10,
+  "closed_set_clips": 30,
+  "cluster_min_size": 5,
+  "bootstrap_replicates": 2000
+}

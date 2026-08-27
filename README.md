@@ -1,115 +1,65 @@
-# DSP501 — Noise-Robust Speaker Embedding with a Designed DSP Front-End
+# DSP501 — Frozen-CNN inference-time front-end factorial ablation
 
-Reproducible research package for the DSP501 final assignment.
+This package trains exactly one `robust_cnn` recipe per seed: VCTK speech with
+on-the-fly MUSAN augmentation. The checkpoint is then frozen and evaluated with a
+2×2 inference-time DSP front-end, not retrained per DSP condition.
 
-**Research problem.** For a speaker embedding trained on noisy VCTK speech,
-which DSP front-end stages actually recover speaker-discriminative information,
-and how much?
+| Band-pass | Wiener | Cell |
+|---:|---:|---|
+| no | no | `raw` |
+| yes | no | `bandpass` |
+| no | yes | `wiener` |
+| yes | yes | `bandpass_wiener` |
 
-The study compares the two systems the assignment requires:
+The same cells are evaluated on clean controls and matched mixtures from MUSAN
+`noise`, `music`, `speech`, and 3–7-source `babble`. Source recordings are split
+train/validation/test before segmentation. Training uses 80% noisy clips, equal
+family sampling, and a deterministic continuous Uniform(0, 20) dB SNR keyed by
+`(seed, epoch, sample_id)`.
 
-* **Pipeline A** (`A_raw_noisy`) — noisy audio with minimal preprocessing.
-* **Pipeline B** (`B_full`) — the full designed chain: high-pass, low-pass,
-  adaptive notch, and an STFT-domain Wiener filter.
-
-Cut-off frequencies are **derived from measured data**, not assumed. `run.py
-analyse-dsp` measures the long-term average spectra of the training speech and
-of the MUSAN noise pool, selects the band that discards at most 1% of speech
-energy at each edge, and then characterises how much noise each arm removes
-versus how much distortion it injects into the speech.
-
-## Setup
+## Reproduce
 
 ```bash
+cd /home/truong51972/projects/dsp
 uv sync
-```
-
-### Data
-
-Both corpora are public and must be downloaded manually under their own
-licences. Place them as follows:
-
-| Corpus | Link | Expected path |
-|---|---|---|
-| VCTK 0.80 | <https://datashare.ed.ac.uk/handle/10283/2651> | `dataset/VCTK-Corpus-0.80/wav48/pXXX/*.wav` |
-| MUSAN (SLR17) | <https://www.openslr.org/17/> | `dataset/musan/noise/**/*.wav` |
-
-Only the VCTK `wav48` audio and the MUSAN `noise` subset are used.
-
-## Run
-
-```bash
-uv run python run.py all --config configs/dsp501-v2.json
-```
-
-Individual stages, in dependency order:
-
-| Stage | What it does |
-|---|---|
-| `prepare` | Speaker-disjoint splits, deterministic silence-trimmed 16 kHz clip cache, and recording-disjoint MUSAN noise pools (train/validation/test). |
-| `analyse-dsp` | Measures speech/noise band power, derives the cut-offs, and characterises what each arm does to real clips. |
-| `tune` | Grid search on Pipeline A with the first seed; the winner is locked for every arm. |
-| `train` | Trains the CNN encoder for each arm and seed. |
-| `evaluate` | Identification and clustering metrics on unseen test speakers across the SNR grid. |
-| `cross-evaluate` | Generalisation matrix: every encoder against every front-end, on an SNR grid that extends below the training range. |
-| `analyze` | Metric summary CSV, paired significance tests, and all report figures. |
-
-Useful flags: `--condition <arm>` restricts train/evaluate to one arm,
-`--workers N` sets the DSP worker-process count, `--output-root DIR` redirects
-outputs.
-
-## Experimental arms
-
-| Arm | Noise | DSP stages | Role |
-|---|---|---|---|
-| `clean` | no | — | ceiling reference |
-| `A_raw_noisy` | yes | — | **Pipeline A** |
-| `B1_hpf` | yes | high-pass | ablation |
-| `B2_hpf_lpf` | yes | + low-pass | ablation |
-| `B3_hpf_lpf_notch` | yes | + notch | ablation |
-| `B_full` | yes | + Wiener | **Pipeline B** |
-| `C_specsub` | yes | spectral subtraction instead of Wiener | denoiser comparison |
-| `X_telephone` | yes | 300–3400 Hz band-pass | over-filtering control |
-
-Arms named in `primary_conditions` run on all three seeds; the remaining
-ablation arms run on the first seed.
-
-## Layout
-
-| Path | Role |
-|---|---|
-| `run.py` | Canonical CLI; the entry point for reproduction. |
-| `configs/dsp501-v2.json` | Every parameter that affects a result. |
-| `src/dsp.py` | IIR filters, tonal-peak detection, STFT Wiener, spectral subtraction. |
-| `src/features.py` | Log-mel, MFCC, Welch PSD, band power, entropy and statistical features. |
-| `src/analysis.py` | Data-driven filter design, signal-level front-end characterisation, model-free speaker separability. |
-| `src/corpus.py` | VCTK splits, silence trimming, clip cache. |
-| `src/noise.py` | Recording-disjoint MUSAN pools and SNR-controlled mixing. |
-| `src/pipeline.py` | Per-condition front-end assembly. |
-| `src/models.py` | CNN speaker encoder and ArcFace head. |
-| `src/train.py` | Training loop. |
-| `src/eval.py` | Identification, clustering, error analysis, significance tests. |
-| `src/study.py` | Stage orchestration. |
-| `src/plots.py` | Report figures. |
-| `main.ipynb` | Read-only analysis dashboard over the saved artifacts. |
-| `report.qmd` | Final report; renders from saved artifacts only. |
-
-## Reproducibility
-
-Noise segment, SNR, crop position, and enrolment partition are deterministic
-functions of the clip identity and the seed, so every arm sees identical
-difficulty and reruns are bit-identical. Hyperparameters are tuned once on
-Pipeline A and then locked, so no arm receives a tuning advantage.
-
-```bash
-uv run pytest -q          # offline DSP and metric tests, no corpus needed
-
-# Quarto defaults to the system python3; point it at the project environment.
+uv run pytest -q
+uv run python run.py all --config configs/config.json
 QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
 ```
 
-## Citation
+Download the VCTK distribution used here from
+[Kaggle: pratt3000/vctk-corpus](https://www.kaggle.com/datasets/pratt3000/vctk-corpus)
+and extract its `wav48` tree to `dataset/VCTK-Corpus-0.80/wav48`. Download MUSAN
+from [OpenSLR 17](https://www.openslr.org/17/) and extract it to `dataset/musan`.
+MUSAN `noise`, `music`, and `speech` recordings are all required; `babble` is
+constructed from 3–7 source-disjoint `speech` recordings.
 
-Cite VCTK and MUSAN per their published terms. This repository supplies the
-experiment; the literature review, ethics statement, and AI declaration required
-by the assignment are authored separately in `report.qmd`.
+`all` without `--run-id` allocates the next immutable experiment (`run-1`,
+`run-2`, ...). A completed run cannot be overwritten; use `--run-id 1` only
+to resume its incomplete phase with the unchanged snapshot configuration.
+
+Stages:
+
+| Stage | Output |
+|---|---|
+| `prepare` | speaker-disjoint VCTK clips and recording-disjoint MUSAN pools in `cache/<data-config-hash>/` |
+| `eda` | frozen run-local `dsp-design.json` and retained-energy design summary |
+| `train` | only `runs/run-N/seed-*/robust_cnn/encoder.pt` checkpoints |
+| `evaluate_raw` | raw-only clean/noisy, unseen/seen reports |
+| `evaluate_dsp` | bandpass, Wiener, and combined reports matched to raw |
+| `signal_analysis` | Wiener positive control and front-end waveform characterization |
+| `statistics` | metric CSV and paired speaker-cluster bootstrap factorial effects |
+| `figures` | report-ready PNG charts from persisted results |
+
+The frozen band-pass is derived only from training speech and training MUSAN pools.
+Its artifact contains the selected edges, inputs, rule and config hash; front-end
+code rejects missing or mismatched artifacts. Inference reports retain target and
+measured SNR, family, source recordings and offsets. Bootstrap resamples test
+speakers while retaining all of their seed, family, SNR and query observations;
+it does not treat seed×SNR cells as independent experiments.
+
+`runs/run-N/config.json` is the exact copied input configuration and its
+`run-manifest.json` records hashes, git revision, phase attempts, outputs,
+checkpoints, and failures. `main.ipynb` creates a new run when `RUN_ID = None`;
+an integer resumes only its failed or pending phase. Quarto only reads a selected
+run's snapshot and artifacts.
