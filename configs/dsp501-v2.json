@@ -1,0 +1,58 @@
+{
+  "study_id": "dsp501-speaker-embedding-v2",
+  "config_version": 2,
+
+  "vctk_root": "dataset/VCTK-Corpus-0.80/wav48",
+  "musan_root": "dataset/musan",
+  "output_root": "outputs",
+
+  "sample_rate": 16000,
+  "segment_seconds": 2.0,
+  "clips_per_speaker": 50,
+  "train_speakers": 60,
+  "validation_speakers": 20,
+
+  "seeds": [11, 22, 33],
+  "primary_conditions": ["clean", "A_raw_noisy", "B_full"],
+  "conditions": {
+    "clean":            {"add_noise": false, "stages": []},
+    "A_raw_noisy":      {"add_noise": true,  "stages": []},
+    "B1_hpf":           {"add_noise": true,  "stages": ["highpass"]},
+    "B2_hpf_lpf":       {"add_noise": true,  "stages": ["highpass", "lowpass"]},
+    "B3_hpf_lpf_notch": {"add_noise": true,  "stages": ["highpass", "lowpass", "notch"]},
+    "B_full":           {"add_noise": true,  "stages": ["highpass", "lowpass", "notch", "wiener"]},
+    "C_specsub":        {"add_noise": true,  "stages": ["highpass", "lowpass", "notch", "specsub"]},
+    "X_telephone":      {"add_noise": true,  "stages": ["telephone"]}
+  },
+  "train_snr_db": [0, 5, 10, 15, 20],
+  "test_snr_db": [0, 5, 10, 15, 20],
+
+  "n_fft": 512,
+  "hop_length": 160,
+  "n_mels": 80,
+  "highpass_hz": 62.5,
+  "lowpass_hz": 4100.0,
+  "telephone_band_hz": [300.0, 3400.0],
+  "notch_max_peaks": 2,
+  "notch_prominence_db": 8.0,
+  "notch_quality": 30.0,
+  "wiener_noise_quantile": 0.1,
+  "wiener_alpha": 0.98,
+  "wiener_gain_floor_db": -18.0,
+  "specsub_over_subtraction": 1.5,
+  "specsub_spectral_floor": 0.05,
+  "preemph_coefficient": 0.97,
+
+  "embedding_dim": 192,
+  "cnn_channels": [32, 64, 128, 256],
+  "arcface_margin": 0.2,
+  "arcface_scale": 30.0,
+  "learning_rate": 0.001,
+  "batch_size": 64,
+  "epochs": 30,
+  "weight_decay": 2e-05,
+  "optimizer": "adamw",
+
+  "enrollment_clips": 10,
+  "cluster_min_size": 5
+}

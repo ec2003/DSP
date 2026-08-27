@@ -1,20 +1,18 @@
 [project]
 name = "dsp"
 version = "0.1.0"
-description = "Add your description here"
+description = "DSP501: noise-robust speaker embeddings with a designed DSP front-end"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "hdbscan>=0.8.40",
     "jupyterlab>=4.4.0",
     "matplotlib>=3.10.0",
-    "pytorch-metric-learning>=2.8.1",
     "pytest>=8.3.5",
     "scikit-learn>=1.6.1",
     "scipy>=1.15.2",
-    "speechbrain>=1.0.3",
+    "soundfile>=0.13.0",
     "torch>=2.13.0",
-    "torchcodec>=0.8.1",
     "torchaudio>=2.11.0",
 ]
 

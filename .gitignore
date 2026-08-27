@@ -158,10 +158,13 @@ env.bak/
 venv.bak/
 
 # Experiment artifacts and downloaded datasets
-dataset/VCTK-Corpus/
+dataset/VCTK-Corpus-0.80/
 dataset/musan/
+dataset/*.zip
+dataset/*.tar.gz
+dataset/*.log
 outputs/
-pretrained_models/
+_site/
 
 # Spyder project settings
 .spyderproject
@@ -225,8 +228,3 @@ __marimo__/
 
 # Models
 resources/
-outputs/
-release/
-pretrained_models/
-dataset/VCTK-Corpus-0.92/
-dataset/musan/

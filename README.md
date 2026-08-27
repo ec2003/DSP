@@ -1,69 +1,111 @@
-# DSP501: Noise-Robust Speaker Verification
+# DSP501 — Noise-Robust Speaker Embedding with a Designed DSP Front-End
 
-This is a reproducible study package for text-independent speaker verification with a SpeechBrain ECAPA-TDNN encoder. It asks whether an offline DSP front end improves verification of VCTK utterances mixed with deterministic composite MUSAN noise.
+Reproducible research package for the DSP501 final assignment.
 
-The primary comparison uses the same source clips, noise provenance, and balanced verification pairs for every condition and seed. No test-set threshold is selected: each pipeline/seed threshold is calibrated on validation pairs and then fixed for all test SNRs.
+**Research problem.** For a speaker embedding trained on noisy VCTK speech,
+which DSP front-end stages actually recover speaker-discriminative information,
+and how much?
 
-## Study protocol
+The study compares the two systems the assignment requires:
 
-The versioned study definition is [configs/dsp501-v1.json](configs/dsp501-v1.json). It fixes 3-second clips, 50 deterministic clips per speaker, speaker-disjoint 80/10/10 splits, seeds `11/22/33`, and test SNRs `5/10/15/20 dB`.
+* **Pipeline A** (`A_raw_noisy`) — noisy audio with minimal preprocessing.
+* **Pipeline B** (`B_full`) — the full designed chain: high-pass, low-pass,
+  adaptive notch, and an STFT-domain Wiener filter.
 
-| Condition | Input transform |
-| --- | --- |
-| `clean_reference` | Clean 16 kHz speech ceiling/reference |
-| `raw_noisy` | Composite MUSAN noise only |
-| `high_pass` | Noise + 80 Hz high-pass |
-| `high_pass_low_pass` | Noise + 80 Hz high-pass + 7.5 kHz low-pass |
-| `full_dsp` | Noise + both filters + Wiener filter (window 29) |
+Cut-off frequencies are **derived from measured data**, not assumed. `run.py
+analyse-bands` measures the long-term average spectra of the training speech and
+of the MUSAN noise pool and selects the band that discards at most 1% of speech
+energy at each edge.
 
-The filters are zero-phase Butterworth filters, so this is an offline method; it is not presented as deployable streaming enhancement. ECAPA receives mono 16 kHz waveform input, with the model-observable band ending at 8 kHz.
-
-DSP inspection utilities expose 512-point STFTs (160-sample hop), Welch PSD/band power, 40-coefficient MFCCs over 80 mel bands, residual SNR, and ECAPA’s internal filterbank frames. The DSP-only reference summarizes MFCC frames by coefficient mean and standard deviation, L2-normalizes the vector, and scores pairs by cosine similarity.
-
-## Setup and data
+## Setup
 
 ```bash
 uv sync
-uv run python run.py download-data --accept-data-licenses
 ```
 
-The download command is intentionally opt-in. It checks archive MD5s, rejects unsafe archive paths, extracts only VCTK 0.92 `wav48_silence_trimmed` `mic1` FLAC and MUSAN `noise` content, and validates the expected layout. Read the licenses and citations first: [VCTK 0.92](https://datashare.ed.ac.uk/items/30e7453c-9ea8-48b4-8e18-f96d0dc62928/full), [MUSAN / SLR17](https://www.openslr.org/17/).
+### Data
+
+Both corpora are public and must be downloaded manually under their own
+licences. Place them as follows:
+
+| Corpus | Link | Expected path |
+|---|---|---|
+| VCTK 0.80 | <https://datashare.ed.ac.uk/handle/10283/2651> | `dataset/VCTK-Corpus-0.80/wav48/pXXX/*.wav` |
+| MUSAN (SLR17) | <https://www.openslr.org/17/> | `dataset/musan/noise/**/*.wav` |
+
+Only the VCTK `wav48` audio and the MUSAN `noise` subset are used.
 
 ## Run
 
-`run.py` is the canonical workflow. The related delivery artifacts have distinct roles:
-
-| Artifact | Role |
-| --- | --- |
-| `run.py` | Canonical, versioned study execution and artifact generation. |
-| `main.ipynb` | Technical dashboard and CLI orchestrator; it only reads saved artifacts for reporting. |
-| `report.qmd` | Final Quarto delivery document; it embeds the completed saved figures and fails clearly if they are absent. |
-
 ```bash
-uv run python run.py prepare
-uv run python run.py tune
-uv run python run.py train
-uv run python run.py evaluate
-uv run python run.py analyze
-uv run python run.py package
+uv run python run.py all --config configs/dsp501-v2.json
 ```
 
-`tune` runs the required `raw_noisy` grid of learning rate `{3e-5, 1e-4}` and encoder-freeze epochs `{0, 1}`, selects lowest validation EER, and records the locked values in `outputs/<study-id>/tuning.json`. All seeds and ablations use that result. `all` runs the complete sequence.
+Individual stages, in dependency order:
 
-Evaluation reports ROC-AUC, EER, accuracy, precision, recall, F1, and `tn/fp/fn/tp`; error entries retain score, threshold margin, source IDs, SNR, residual-SNR, and MFCC diagnostics. Analysis emits machine-readable JSON/CSV, SNR curves, and paired stratified-bootstrap 95% CIs for full-DSP minus raw-noisy F1. The release command creates an ignored `release/<study-id>/` bundle with source/config/lock files, checkpoints and reports when present, optional ECAPA cache, and a SHA-256 manifest; raw datasets are deliberately excluded.
+| Stage | What it does |
+|---|---|
+| `prepare` | Speaker-disjoint splits, deterministic silence-trimmed 16 kHz clip cache, MUSAN noise pool. |
+| `analyse-bands` | Measures speech/noise band power and reports the derived cut-offs. |
+| `tune` | Grid search on Pipeline A with the first seed; the winner is locked for every arm. |
+| `train` | Trains the CNN encoder for each arm and seed. |
+| `evaluate` | Identification and clustering metrics on unseen test speakers across the SNR grid. |
+| `analyze` | Metric summary CSV, paired significance tests, and all report figures. |
 
-Run the offline tests with:
+Useful flags: `--condition <arm>` restricts train/evaluate to one arm,
+`--workers N` sets the DSP worker-process count, `--output-root DIR` redirects
+outputs.
+
+## Experimental arms
+
+| Arm | Noise | DSP stages | Role |
+|---|---|---|---|
+| `clean` | no | — | ceiling reference |
+| `A_raw_noisy` | yes | — | **Pipeline A** |
+| `B1_hpf` | yes | high-pass | ablation |
+| `B2_hpf_lpf` | yes | + low-pass | ablation |
+| `B3_hpf_lpf_notch` | yes | + notch | ablation |
+| `B_full` | yes | + Wiener | **Pipeline B** |
+| `C_specsub` | yes | spectral subtraction instead of Wiener | denoiser comparison |
+| `X_telephone` | yes | 300–3400 Hz band-pass | over-filtering control |
+
+Arms named in `primary_conditions` run on all three seeds; the remaining
+ablation arms run on the first seed.
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `run.py` | Canonical CLI; the entry point for reproduction. |
+| `configs/dsp501-v2.json` | Every parameter that affects a result. |
+| `src/dsp.py` | IIR filters, tonal-peak detection, STFT Wiener, spectral subtraction. |
+| `src/features.py` | Log-mel, MFCC, Welch PSD, band power, entropy and statistical features. |
+| `src/analysis.py` | Data-driven filter design. |
+| `src/corpus.py` | VCTK splits, silence trimming, clip cache. |
+| `src/noise.py` | MUSAN pool and SNR-controlled mixing. |
+| `src/pipeline.py` | Per-condition front-end assembly. |
+| `src/models.py` | CNN speaker encoder and ArcFace head. |
+| `src/train.py` | Training loop. |
+| `src/eval.py` | Identification, clustering, error analysis, significance tests. |
+| `src/study.py` | Stage orchestration. |
+| `src/plots.py` | Report figures. |
+| `main.ipynb` | Read-only analysis dashboard over the saved artifacts. |
+| `report.qmd` | Final report; renders from saved artifacts only. |
+
+## Reproducibility
+
+Noise segment, SNR, crop position, and enrolment partition are deterministic
+functions of the clip identity and the seed, so every arm sees identical
+difficulty and reruns are bit-identical. Hyperparameters are tuned once on
+Pipeline A and then locked, so no arm receives a tuning advantage.
 
 ```bash
-uv run pytest -q
+uv run pytest -q          # offline DSP and metric tests, no corpus needed
+quarto render report.qmd  # after a completed run
 ```
 
-After a completed run, render the final report (HTML or PDF) with Quarto:
+## Citation
 
-```bash
-quarto render report.qmd
-```
-
-The HTML target uses embedded resources for a portable delivery file. Before submission, replace the ethics and AI-use declaration placeholders in `report.qmd` with the required course-specific statements.
-
-Research-protocol, ethics/AI-declaration, and literature-matrix inputs should accompany a submitted report. This repository supplies the reproducible experiment rather than a completed paper or literature review.
+Cite VCTK and MUSAN per their published terms. This repository supplies the
+experiment; the literature review, ethics statement, and AI declaration required
+by the assignment are authored separately in `report.qmd`.
