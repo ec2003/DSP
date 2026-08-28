@@ -3,6 +3,7 @@ project:
   output-dir: _site
   render:
     - report.qmd
+    - report.en.qmd
 
 execute:
   echo: false

@@ -186,7 +186,6 @@ Ba quan sát rút ra từ phần trên. Thứ nhất, các công trình đạt c
 %%| label: fig-framework
 %%| fig-cap: "Khung nghiên cứu: từ vấn đề tới đánh giá. Chỉ khối DSP processing thay đổi giữa các điều kiện so sánh."
 %%| fig-width: 7
-%%| fig-height: 3
 %%| out-width: "95%"
 %%{init: {"flowchart": {"nodeSpacing": 15, "rankSpacing": 22}, "themeVariables": {"fontSize": "11px"}}}%%
 flowchart LR

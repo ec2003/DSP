@@ -1,131 +1,506 @@
 ---
-title: "Inference-Time DSP 2×2 Ablation on a Frozen Robust Speaker CNN"
-subtitle: "DSP501 Final Assignment"
-author: "[Group name; student names and IDs]"
+title: "Can Inference-Time DSP Preprocessing Improve Noise-Robust Speaker Recognition with a CNN?"
+subtitle: "DSP501 Final Assignment — 2×2 factorial ablation on a frozen encoder"
+author: "Trần Quốc Trường; Trần Trung Hiếu"
 date: last-modified
-format:
-  html:
-    embed-resources: true
-    toc: true
-    number-sections: true
-  pdf:
-    toc: true
-    number-sections: true
 bibliography: references.bib
-execute:
-  echo: false
-  warning: false
+csl: ieee.csl
+format:
+  html: {embed-resources: true, toc: true, number-sections: true}
+  pdf:
+    toc: false
+    number-sections: true
+    documentclass: article
+    fontsize: 10pt
+    geometry: [top=2cm, bottom=2cm, left=2.1cm, right=2.1cm]
+    linestretch: 1.0
+    fig-pos: "htbp"
+    fig-align: center
+    out-width: "72%"
+    tbl-colwidths: auto
+    include-in-header:
+      text: |
+        \usepackage{caption}
+                \usepackage{float}
+        \captionsetup{font=small, skip=3pt}
+        \setlength{\textfloatsep}{6pt}
+        \setlength{\intextsep}{6pt}
+        \setlength{\parskip}{2pt}
+execute: {echo: false, warning: false}
 ---
 
 ```{python}
+#| label: load-artifacts
 from __future__ import annotations
-
-import csv
-import json
+import csv, json, platform, sys
+from collections import Counter, defaultdict
 from pathlib import Path
-
+import numpy as np
 from IPython.display import Image, Markdown, display
 
-ROOT = Path.cwd().resolve()
-WORKING_CONFIG = json.loads((ROOT / "configs" / "config.json").read_text(encoding="utf-8"))
-STUDY = ROOT / WORKING_CONFIG["output_root"] / WORKING_CONFIG["study_id"]
-RUN_ID = 1  # select one completed immutable experiment run before rendering
-RUN = STUDY / "runs" / f"run-{RUN_ID}"
+ROOT = Path.cwd().resolve(); RUN_ID = 2
+working = json.loads((ROOT / "configs" / "config.json").read_text())
+RUN = ROOT / working["output_root"] / working["study_id"] / "runs" / f"run-{RUN_ID}"
 REPORTS = RUN / "reports"
-CONFIG = json.loads((RUN / "config.json").read_text(encoding="utf-8")) if (RUN / "config.json").is_file() else WORKING_CONFIG
-REQUIRED = [RUN / "run-manifest.json", RUN / "dsp-design.json", REPORTS / "metric-summary.csv", REPORTS / "factorial-bootstrap.json", REPORTS / "wiener-positive-control.json"]
-missing = [str(path) for path in REQUIRED if not path.is_file()]
-if missing:
-    raise FileNotFoundError(
-        "Run from the project root first: `uv run python run.py all --config configs/config.json`; "
-        "then select its completed RUN_ID. Missing:\n" + "\n".join(missing)
-    )
-
-MANIFEST = json.loads((RUN / "run-manifest.json").read_text(encoding="utf-8"))
-DESIGN = json.loads((RUN / "dsp-design.json").read_text(encoding="utf-8"))
-POSITIVE = json.loads((REPORTS / "wiener-positive-control.json").read_text(encoding="utf-8"))
-FACTORIAL = json.loads((REPORTS / "factorial-bootstrap.json").read_text(encoding="utf-8"))
-with (REPORTS / "metric-summary.csv").open(newline="", encoding="utf-8") as stream:
-    METRICS = list(csv.DictReader(stream))
-
-def mean_accuracy(cell: str, family: str | None = None, clean: bool = False) -> float | None:
-    values = [
-        float(row["accuracy"])
-        for row in METRICS
-        if row["protocol"] == "unseen" and row["cell"] == cell
-        and ((row["audio_domain"] == "clean") if clean else row["noise_family"] == family)
-    ]
-    return sum(values) / len(values) if values else None
-
-def fmt(value: float | None) -> str:
-    return "—" if value is None else f"{value:.3f}"
+REQUIRED = [RUN / name for name in ("config.json", "run-manifest.json", "dsp-design.json", "tuning-summary.json", "training-summary.json")]
+REQUIRED += [REPORTS / name for name in ("metric-summary.csv", "factorial-bootstrap.json", "wiener-positive-control.json", "front-end-characterisation.json")]
+missing = [str(p.relative_to(ROOT)) for p in REQUIRED if not p.is_file()]
+if missing: raise FileNotFoundError(f"Missing artifacts for run-{RUN_ID}:\n- " + "\n- ".join(missing))
+CONFIG = json.loads((RUN / "config.json").read_text()); MANIFEST = json.loads((RUN / "run-manifest.json").read_text())
+DESIGN = json.loads((RUN / "dsp-design.json").read_text()); TRAINING = json.loads((RUN / "training-summary.json").read_text())
+TUNING = json.loads((RUN / "tuning-summary.json").read_text())
+FACTORIAL = json.loads((REPORTS / "factorial-bootstrap.json").read_text())
+POSITIVE = json.loads((REPORTS / "wiener-positive-control.json").read_text())
+FRONTEND = json.loads((REPORTS / "front-end-characterisation.json").read_text())["measurements"]
+with (REPORTS / "metric-summary.csv").open(newline="") as f: METRICS = list(csv.DictReader(f))
+CELLS = ("raw", "bandpass", "wiener", "bandpass_wiener")
+PIPELINE = {"raw": "A (minimal DSP)", "bandpass": "ablation: band-pass only", "wiener": "ablation: Wiener only", "bandpass_wiener": "B (full DSP)"}
+FAMILIES = tuple(CONFIG["test_noise_families"]); SNRS = tuple(map(float, CONFIG["test_snr_db"]))
+EVALUATIONS = []
+for path in sorted(RUN.glob("seed-*/robust_cnn/evaluation-*.json")):
+    item = json.loads(path.read_text()); item["_path"] = path; EVALUATIONS.append(item)
+def mean(xs): return sum(xs) / len(xs) if xs else None
+def fmt(x, n=3): return "—" if x is None else f"{x:.{n}f}"
+def signed(x, n=4): return "—" if x is None else f"{x:+.{n}f}"
+def table(headers, rows):
+    return Markdown("| " + " | ".join(map(str, headers)) + " |\n|" + "|".join(["---"] * len(headers)) + "|\n" + "\n".join("| " + " | ".join(map(str, row)) + " |" for row in rows))
+def vals(cell, protocol="unseen", domain="noisy", family=None, snr=None, seed=None, field="accuracy"):
+    return [float(x[field]) for x in METRICS if x["cell"] == cell and x["protocol"] == protocol and x["audio_domain"] == domain and (family is None or x["noise_family"] == family) and (snr is None or float(x["test_snr_db"]) == float(snr)) and (seed is None or int(x["seed"]) == int(seed))]
+def mm(cell, **kwargs): return mean(vals(cell, **kwargs))
+def report_metrics(cell, protocol="unseen", domain="noisy"):
+    rs = [x for x in EVALUATIONS if x["cell"] == cell and x["protocol"] == protocol and x["audio_domain"] == domain]
+    return {k: mean([float(x["nearest_centroid"][k]) for x in rs]) for k in ("accuracy", "precision_macro", "recall_macro", "f1_macro")}
+def eff(name, protocol="unseen"): return FACTORIAL[protocol]["accuracy"][name]
+def ci(name, protocol="unseen"):
+    e = eff(name, protocol); return f"[{e['ci_low']:+.4f}, {e['ci_high']:+.4f}]"
+def verdict(name, protocol="unseen"):
+    e = eff(name, protocol)
+    if e["ci_low"] > 0: return "significant improvement"
+    if e["ci_high"] < 0: return "significant reduction"
+    return "indistinguishable from 0"
+def gain(cell, snr=None):
+    rows = [x for x in FRONTEND if x["cell"] == cell and (snr is None or float(x["input_snr_db"]) == float(snr))]
+    return mean([float(x["snr_gain_db"]) for x in rows])
+def fig(name):
+    path = REPORTS / name
+    if not path.is_file(): raise FileNotFoundError(path)
+    display(Image(filename=str(path)))
+BEST = max(TRAINING, key=lambda x: x["best_validation_accuracy"]); HARD_SNR = min(SNRS)
+LOW_RAW = [x for x in EVALUATIONS if x["cell"] == "raw" and x["protocol"] == "unseen" and x["audio_domain"] == "noisy" and float(x["test_snr_db"]) == HARD_SNR]
+LOW_B = [x for x in EVALUATIONS if x["cell"] == "bandpass_wiener" and x["protocol"] == "unseen" and x["audio_domain"] == "noisy" and float(x["test_snr_db"]) == HARD_SNR]
+LOW_ERRORS = [q | {"family": x["noise_family"], "seed": x["seed"]} for x in LOW_RAW for q in x["query_predictions"] if not q["correct"]]
+SPEAKER_ALIAS = {s: f"SPK-{i:02d}" for i, s in enumerate(sorted({q["speaker_id"] for r in LOW_RAW for q in r["query_predictions"]}), 1)}
+SAMPLE_ALIAS = {s: f"Q-{i:03d}" for i, s in enumerate(sorted({q["sample_id"] for r in LOW_RAW for q in r["query_predictions"]}), 1)}
 ```
 
-# Summary
+# Abstract {.unnumbered}
 
-This experiment freezes one `robust_cnn` speaker encoder per seed, trained on
-clean VCTK with deterministic on-the-fly MUSAN augmentation. It then evaluates
-the same pre-DSP mixture in all four inference-time cells: `raw`, `bandpass`,
-`wiener`, and `bandpass_wiener`. Thus a cell difference is a front-end effect,
-not a retraining effect.
+Noise augmentation is now the default way to make speaker embeddings robust, yet practical deployments often add a DSP preprocessing block before the encoder. This report tests that assumption directly: when a noise-robust encoder is **frozen**, does a fixed inference-time DSP front-end improve recognition accuracy? We train a log-mel CNN with ArcFace on VCTK, augment with MUSAN, use three seeds, and select hyperparameters by grid search on validation speakers. The same mixture passes through a 2×2 factorial design with a Butterworth band-pass and STFT Wiener filter: `raw` is Pipeline A, `bandpass_wiener` is Pipeline B, and the other cells are single-stage ablations. On the speaker-disjoint protocol, Pipeline A reaches `{python} fmt(mm('raw', domain='clean'))` accuracy on clean audio and `{python} fmt(mm('raw'))` averaged over noise, versus `{python} fmt(mm('bandpass_wiener'))` for Pipeline B. Speaker-paired bootstrap (`{python} f"{CONFIG['bootstrap_replicates']:,}"` resamples) gives a band-pass main effect of `{python} signed(eff('bandpass_main')['mean_delta'])` (95% CI `{python} ci('bandpass_main')`) and a Wiener main effect of `{python} signed(eff('wiener_main')['mean_delta'])` (95% CI `{python} ci('wiener_main')`). The positive control confirms that Wiener increases waveform SNR by `{python} fmt(POSITIVE['measurements'][0]['snr_gain_db'], 2)` dB, but this gain does not transfer to recognition. For a robust encoder, a fixed DSP front-end is a cost rather than a benefit, and waveform SNR is a misleading proxy for embedding quality.
 
-The selected run is `{python} MANIFEST['run_tag']`; its manifest binds the
-results to config hash `{python} MANIFEST['config_hash'][:12]}` and data-cache
-hash `{python} MANIFEST['data_cache_hash']}`. The shared corpus/MUSAN cache is
-stored separately under `cache/<data-config-hash>/`; all checkpoints, DSP design,
-reports, metrics, and plots are under `runs/run-N/`.
+**Keywords—** speaker identification, noise robustness, digital filtering, Wiener filtering, log-mel/MFCC, factorial ablation, reproducible research.
 
-# Data and protocol
+# Introduction
 
-VCTK `wav48` is split by speaker into training, validation, and test groups.
-MUSAN `noise`, `music`, and `speech` source recordings are split before
-segmentation. Babble is the sum of 3–7 independently selected `speech` sources
-from the same recording-disjoint partition. Training augmentation selects its
-family and continuous SNR deterministically from `(seed, epoch, sample_id)`.
+Intelligent signal-processing systems follow the chain *physical signal → sampling and quantisation → DSP → feature extraction → AI model → decision*. Speaker recognition occupies this entire chain, and DSP strongly influences quality: the encoder sees only the signal after filtering, transformation, and feature compression.
 
-The VCTK source is the [Kaggle VCTK distribution](https://www.kaggle.com/datasets/pratt3000/vctk-corpus);
-MUSAN is [OpenSLR 17](https://www.openslr.org/17/). Both datasets must be
-downloaded/extracted manually; the pipeline preflight checks the expected local
-`wav48` and `noise`/`music`/`speech` layout before cache materialisation.
+In real environments, recordings are mixtures of target speech and noise such as music, device noise, and overlapping speech. Two strategies coexist in the literature: *clean the signal* with speech enhancement, or *make the model invariant to noise* through augmentation or specialised objectives. Recent surveys identify robustness and evaluation protocols as central issues [@kabir2021; @hanifa2021; @sharma2024].
 
-# Frozen DSP design
+The literature less often tests the **interaction between these strategies**. Once an encoder has learned from noisy augmentation, does an inference-time DSP front-end still add value, or is it redundant or harmful? Each DSP stage costs latency and may destroy cues used by the encoder.
 
-The passband is derived only from training speech and training MUSAN pools, then
-stored as a run-local artifact. The selected edges for this run are
-`{python} DESIGN['selected_edges_hz']`. A Gaussian-noise Wiener positive control
-is recorded separately; it verifies technical SNR gain but is not recognition
-evidence.
+This report isolates one variable. All evidence comes from one immutable run (`{python} MANIFEST['run_tag']`, config hash `{python} MANIFEST['config_hash'][:12]`); the report only reads artifacts and does not retrain or reevaluate.
 
-# Results
+# Research Problem
+
+Increasing waveform SNR does **not** imply preserving speaker-discriminative information. Removing out-of-band noise can also remove high-order formants and spectral detail; Wiener filtering can distort harmonics and introduce nonlinear artifacts. The research problem is:
+
+> **For a noise-robust, frozen CNN speaker-recognition model, how does a fixed inference-time DSP front-end (band-pass, Wiener, or both) change recognition accuracy, and can that change be predicted by a signal-quality metric alone?**
+
+The scope is deliberately narrow: one corpus, one architecture, one training recipe, four noise families, and five SNR levels. This supports a causal conclusion rather than a simple performance comparison.
+
+# Research Objectives
+
+**O1.** Quantify Pipeline A degradation by SNR, noise family, and the *unseen* (speaker-disjoint) versus *seen* (closed-set) protocols.
+
+**O2.** Estimate the main effects and interaction of the two inference-time DSP stages using a paired 2×2 factorial design and speaker-level bootstrap intervals.
+
+**O3.** Test whether waveform SNR gain predicts recognition-level improvement.
+
+# Research Questions
+
+**RQ1.** How does Pipeline A accuracy vary with SNR and MUSAN noise family, and what is the gap between *unseen* and *seen*?
+
+**RQ2.** With checkpoint, mixture, enrollment, query, and seed fixed, what are the signs and magnitudes of the band-pass effect, Wiener effect, and interaction?
+
+**RQ3.** Does waveform SNR gain predict recognition gain?
+
+**RQ4.** What does the error structure look like in the hardest condition, and does Pipeline B change it?
+
+**Hypotheses.** An effect is significant only when its speaker-paired 95% bootstrap interval **does not contain 0**.
+
+* **H1.** Pipeline B improves accuracy over Pipeline A on noisy audio ($\Delta_{BW} > 0$).
+* **H2.** Waveform SNR gain is positively correlated with recognition gain.
+
+# Literature Review
+
+The 2021–2024 literature falls into four strands. Surveys [@kabir2021; @hanifa2021; @sharma2024] identify condition mismatch as the main degradation source. Enhancement and embedding methods [@li2021; @mohammadamini2022] optimise enhancement for the speaker objective. Regularisation and invariance methods [@wang2021; @novoselov2023] place robustness inside the model. Data-distribution and backend studies [@li2022cnceleb; @ferrer2022] locate the issue in domain mismatch and calibration rather than filtering.
+
+The complete comparison matrix appears in Appendix A.
+
+# Research Gap
+
+Successful systems generally **retrain** or **jointly train** front-end and encoder; few examine attaching a fixed front-end to a frozen encoder. Enhancement ablations often also change training data, confounding effects, and reported means often treat correlated observations as independent.
+
+**Gap addressed:** an ablation *only at inference time*, using the *same bit-identical mixture*, a *frozen augmented encoder*, separate *seen/unseen* protocols, and *speaker-paired* inference.
+
+# Expected Contributions
+
+1. **An inference-time 2×2 factorial design** isolating DSP effects from training variables.
+2. **Two-level leakage prevention** through speaker-disjoint and recording-level noise splits.
+3. **Inference at the correct unit** through speaker-level bootstrap.
+4. **Quantitative evidence separating SNR and recognition**, with a positive control.
+5. **An immutable reproducibility package** of snapshots, hashes, manifests, and artifacts.
+
+# Methodology
+
+## Research framework
+
+```{mermaid}
+%%| label: fig-framework
+%%| fig-cap: "Research framework: from problem to evaluation. Only the DSP processing block changes across comparison conditions."
+%%| fig-width: 7
+%%| out-width: "95%"
+%%{init: {"flowchart": {"nodeSpacing": 15, "rankSpacing": 22}, "themeVariables": {"fontSize": "11px"}}}%%
+flowchart LR
+    P["Research<br/>problem"] --> D["VCTK + MUSAN<br/>16 kHz"]
+    D --> F["DSP 2×2<br/>raw / BP / W / BP+W"]
+    F --> X["80-bin<br/>log-mel"]
+    X --> E["Frozen CNN<br/>ArcFace"]
+    E --> V["Identification<br/>speaker bootstrap"]
+    D --> T["Noise-augmented<br/>training"]
+    T --> E
+```
+
+Only the *DSP processing* block changes. Mixture, seed, SNR, family, features, checkpoint, enrollment, and query remain fixed.
+
+## Dataset, sampling and partitioning
+
+The signal source is VCTK `wav48` [@vctk] and MUSAN noise [@musan]. Signals are resampled to `{python} CONFIG['sample_rate']` Hz, with Nyquist `{python} CONFIG['sample_rate'] // 2` Hz, then cut into `{python} CONFIG['segment_seconds']`-s clips after silence removal. Test speakers never occur in training, and MUSAN recordings are split before segmentation. `babble` is synthesised from `{python} CONFIG['babble_sources_range'][0]`–`{python} CONFIG['babble_sources_range'][1]` independent speech sources.
+
+```{python}
+display(table(["component", "design"], [
+ ["speaker split", f"{CONFIG['train_speakers']} train / {CONFIG['validation_speakers']} validation / remaining speakers are unseen test, speaker-disjoint"],
+ ["clip", f"{CONFIG['clips_per_speaker']} clips/speaker during training; {CONFIG['eval_clips_per_speaker']} clips/speaker during evaluation"],
+ ["unseen protocol", f"enrollment {CONFIG['enrollment_clips']} clips/speaker, query is the remainder; speakers never seen during training"],
+ ["seen protocol", f"closed-set on {CONFIG['train_speakers']} training speakers with {CONFIG['closed_set_clips']} separately held-out clips"],
+ ["training noise", f"{', '.join(CONFIG['train_noise_families'])}; p(noise)={CONFIG['p_noise']}; continuous SNR {CONFIG['train_snr_range_db'][0]:g}–{CONFIG['train_snr_range_db'][1]:g} dB"],
+ ["test noise", f"{len(FAMILIES)} families × {', '.join(f'{x:g}' for x in SNRS)} dB, plus clean condition"],
+ ["noise partition", f"MUSAN recordings split {'/'.join(f'{x:g}' for x in CONFIG['noise_split_fractions'])} by recording BEFORE segmentation"],
+ ["seed", f"{', '.join(map(str, CONFIG['seeds']))}; bit-identical paired mixtures across four cells"],
+]))
+```
+
+`seen` is easier because its classes are known, so the protocols are reported separately.
+
+## DSP preprocessing: Pipeline A and Pipeline B
+
+Pipeline A uses minimal preprocessing and Pipeline B the full chain; the other cells are single-stage ablations.
+
+```{python}
+display(table(["cell", "role", "band-pass", "Wiener"], [[c, PIPELINE[c], "yes" if "bandpass" in c else "no", "yes" if "wiener" in c else "no"] for c in CELLS]))
+```
+
+```{python}
+display(table(["technique group", "technique used in project", "role"], [
+ ["Frequency analysis", f"STFT (Hann, n_fft={CONFIG['n_fft']}, hop={CONFIG['hop_length']})", "analysis domain for Wiener and log-mel"],
+ ["Filtering", f"IIR Butterworth band-pass order {CONFIG['bandpass_order']}, SOS form, zero-phase filtering", "remove out-of-band speech energy"],
+ ["Spectral / power", "Welch PSD and band power", "data-driven basis for passband selection"],
+ ["Cepstral", f"log-mel {CONFIG['n_mels']} bands (MFCC family, no DCT)", "CNN input features"],
+]))
+```
+
+**Data-driven passband design.** Training speech and noise PSDs use Welch [@welch1967],
+
+$$\widehat P_{xx}(f)=\frac{1}{K}\sum_{k=1}^{K}\frac{\bigl|\mathcal{F}\{w[n]\\,x_k[n]\}\bigr|^{2}}{f_s\sum_n w^2[n]},$$
+
+with boundaries at `{python} f"{CONFIG['band_speech_energy_margin']*100:g}"`% and `{python} f"{100-CONFIG['band_speech_energy_margin']*100:g}"`% cumulative speech energy, accepted only when removed regions are noise-dominated. The frozen band is `{python} DESIGN['selected_edges_hz']['low']`–`{python} DESIGN['selected_edges_hz']['high']` Hz, retaining `{python} f"{DESIGN['retained_energy_pct']['speech']:.2f}"`% speech energy and `{python} f"{DESIGN['retained_energy_pct']['noise']:.2f}"`% noise energy.
+
+```{python}
+#| label: fig-passband
+#| fig-cap: "Welch PSD of training speech and noise with the frozen passband."
+fig("eda-passband.png")
+```
+
+The Butterworth prototype is $|H(f)|^{2}=1/\bigl[1+(f/f_c)^{2N}\bigr]$. SOS and zero-phase filtering improve stability and remove phase shifts; this is offline, non-causal processing.
+
+**STFT-domain Wiener filter.** Noise PSD uses the `{python} f"{CONFIG['wiener_noise_quantile']*100:g}"`% lowest-energy frames and a decision-directed gain [@ephraim1984]:
+
+$$G_{t,f}=\max\!\left(g_{\min},\;\frac{\xi_{t,f}}{1+\xi_{t,f}}\right),\qquad
+\xi_{t,f}=\alpha\frac{|\widehat S_{t-1,f}|^{2}}{\widehat N_f}+(1-\alpha)\max\!\left(\frac{|Y_{t,f}|^{2}}{\widehat N_f}-1,\,0\right),$$
+
+with $\alpha=$ `{python} CONFIG['wiener_alpha']` and gain floor `{python} CONFIG['wiener_gain_floor_db']` dB. The stationary-noise assumption is violated by `music` and `babble`.
+
+## Feature extraction
+
+The front-end output passes through an STFT and `{python} CONFIG['n_mels']` mel filters (20 Hz–7.9 kHz), logarithmisation, and utterance-level mean–variance normalisation.
+
+```{python}
+#| label: fig-gallery
+#| fig-cap: "One test clip: waveform, STFT spectrogram, and normalised log-mel — clean, after noise mixing, and after each DSP front-end."
+fig("signal-gallery.png")
+```
+
+## AI model design and hyperparameter tuning
+
+The model is a log-mel CNN with attentive statistics pooling and a 192-dimensional L2-normalised embedding, trained with ArcFace [@arcface]. Its angular margin matches the cosine distance used for nearest-centroid recognition.
+
+**Grid search.** Learning rate and ArcFace margin use a `{python} len(TUNING['search_space']['learning_rate'])`×`{python} len(TUNING['search_space']['arcface_margin'])` grid. Each trial trains `{python} TUNING['protocol']['epochs_per_trial']` epochs on seed `{python} TUNING['protocol']['seed']` and is scored only on validation speakers. The best configuration reaches `{python} fmt(TUNING['selected']['validation_accuracy'], 4)` versus `{python} fmt(min(t['best_validation_accuracy'] for t in TUNING['trials']), 4)` for the worst.
+
+```{python}
+display(table(["learning rate", "ArcFace margin", "validation accuracy", "best epoch"], [[f"{t['learning_rate']:g}", f"{t['arcface_margin']:g}", fmt(t['best_validation_accuracy'], 4), t['best_epoch'] + 1] for t in TUNING["trials"]]))
+```
+
+```{python}
+#| label: fig-tuning
+#| fig-cap: "Validation accuracy on the learning-rate × ArcFace-margin grid. The winning configuration is used for all three seeds."
+#| out-width: "58%"
+fig("tuning-grid.png")
+```
+
+```{python}
+display(table(["item", "value"], [["log-mel", f"{CONFIG['n_mels']} mel bands; n_fft {CONFIG['n_fft']}; hop {CONFIG['hop_length']}"], ["CNN / embedding", f"channels {CONFIG['cnn_channels']}; embedding {CONFIG['embedding_dim']} dimensions; {BEST['n_parameters']:,} parameters"], ["ArcFace", f"margin={TUNING['selected']['arcface_margin']:g} (tuned); scale={CONFIG['arcface_scale']:g}"], ["optimizer", f"{CONFIG['optimizer']}; lr={TUNING['selected']['learning_rate']:g} (tuned); weight decay={CONFIG['weight_decay']:g}; cosine annealing"], ["batch / epochs", f"{CONFIG['batch_size']} / {CONFIG['epochs']}"], ["model selection", "highest validation-accuracy epoch, selected per seed"], ["training results", ", ".join(f"seed {x['seed']}: {x['best_validation_accuracy']:.4f} @ epoch {x['best_epoch']+1}" for x in TRAINING)]]))
+```
+
+```{python}
+#| label: fig-training
+#| fig-cap: "Training curves for three seeds: training loss and validation-speaker recognition accuracy."
+fig("training-histories.png")
+```
+
+# Experimental Design
+
+**Independent variables.** `bandpass` ∈ {off, on}; `wiener` ∈ {off, on}; noise family ∈ {`{python} ", ".join(FAMILIES)`}; input SNR ∈ {`{python} ", ".join(f"{x:g}" for x in SNRS)`} dB plus clean; protocol ∈ {unseen, seen}.
+
+**Dependent variables.** Primary endpoint is closed-set nearest-centroid accuracy; macro precision, recall, macro-F1, and confusion matrices use the same predictions. Waveform SNR is used only for RQ3. Checkpoint, seed, noise segment, offset, target SNR, enrollment, and query are identical within comparisons. Three seeds (`{python} ", ".join(map(str, CONFIG['seeds']))`) cover the full grid and both protocols.
+
+**Statistical inference.** Speakers are resampled with replacement `{python} f"{CONFIG['bootstrap_replicates']:,}"` times, retaining every seed × SNR × family × query observation. Main effects average contrasts over the other factor; interaction is
+
+$$\Delta_{B\times W} = A_{11}-A_{10}-A_{01}+A_{00},$$
+
+where $A_{ij}$ is accuracy for band-pass $=i$, Wiener $=j$. Intervals are percentile 95% intervals. A stationary-Gaussian-noise positive control verifies implementation. Run `{python} MANIFEST['run_tag']`, status `{python} MANIFEST['status']`, git revision `{python} MANIFEST['git_revision'][:12]`, and data cache `{python} MANIFEST['data_cache_hash']` are recorded.
+
+# Experimental Results
+
+## Pipeline A robustness by SNR, noise family, and protocol (RQ1)
+
+```{python}
+display(table(["protocol", "clean", *[f"{x:g} dB" for x in SNRS]], [[p, fmt(mm("raw", protocol=p, domain="clean")), *[fmt(mm("raw", protocol=p, snr=s)) for s in SNRS]] for p in ("unseen", "seen")]))
+```
+
+Pipeline A accuracy on `unseen` rises from `{python} fmt(mm('raw', snr=min(SNRS)))` at `{python} f"{min(SNRS):g}"` dB to `{python} fmt(mm('raw', snr=max(SNRS)))` at `{python} f"{max(SNRS):g}"` dB, versus `{python} fmt(mm('raw', domain='clean'))` on clean audio. `seen` is systematically higher (`{python} fmt(mm('raw', protocol='seen'))` versus `{python} fmt(mm('raw'))` on noise); the quantities are not pooled.
+
+```{python}
+display(table(["cell (unseen, noisy)", *FAMILIES, "mean"], [[c, *[fmt(mm(c, family=f)) for f in FAMILIES], fmt(mm(c))] for c in CELLS]))
+```
+
+```{python}
+#| label: fig-snr
+#| fig-cap: "Accuracy on the unseen protocol by input SNR, separated by MUSAN noise family. The four curves in each panel are the four factorial cells."
+fig("snr-curves.png")
+```
+
+## Complete metrics by protocol and cell
 
 ```{python}
 rows = []
-for cell in ("raw", "bandpass", "wiener", "bandpass_wiener"):
-    rows.append([cell, fmt(mean_accuracy(cell, clean=True)), *[fmt(mean_accuracy(cell, family=family)) for family in CONFIG["test_noise_families"]]])
-display(Markdown("| cell | clean | " + " | ".join(CONFIG["test_noise_families"]) + " |\n|---|" + "|".join(["---"] * (1 + len(CONFIG["test_noise_families"]))) + "|\n" + "\n".join("| " + " | ".join(row) + " |" for row in rows)))
+for p in ("unseen", "seen"):
+    for c in CELLS:
+        x = report_metrics(c, p)
+        rows.append([p, c, fmt(x["accuracy"]), fmt(x["precision_macro"]), fmt(x["recall_macro"]), fmt(x["f1_macro"])])
+display(table(["protocol", "cell", "accuracy", "precision macro", "recall macro", "macro-F1"], rows))
 ```
 
 ```{python}
-display(Image(filename=str(REPORTS / "snr-curves.png")))
-display(Image(filename=str(REPORTS / "factorial-effects.png")))
-display(Image(filename=str(REPORTS / "snr-recognition-tradeoff.png")))
+display(table(["seed (unseen, noisy)", *CELLS], [[s, *[fmt(mm(c, seed=s)) for c in CELLS]] for s in CONFIG["seeds"]]))
 ```
 
-Factorial contrasts use a paired bootstrap whose resampling unit is the test
-speaker; all seed, SNR, family, and query observations for a selected speaker
-are retained together. The bootstrap result is saved in
-`reports/factorial-bootstrap.json`, not inferred from a DSP SNR gain alone.
+Cell rankings remain unchanged by seed and across metrics.
+
+## Paired factorial effects (RQ2)
+
+```{python}
+label = {"bandpass_main": "main effect: band-pass", "wiener_main": "main effect: Wiener", "bandpass_x_wiener": "interaction B×W", "bandpass_minus_raw": "band-pass − A", "wiener_minus_raw": "Wiener − A", "bandpass_wiener_minus_raw": "B − A"}
+rows = []
+for p in ("unseen", "seen"):
+    for name, r in FACTORIAL[p]["accuracy"].items():
+        rows.append([p, label[name], r["n_speakers"], signed(r["mean_delta"]), f"[{r['ci_low']:+.4f}, {r['ci_high']:+.4f}]", verdict(name, p)])
+display(table(["protocol", "contrast", "speakers", "mean Δ accuracy", "95% bootstrap CI", "conclusion"], rows))
+```
+
+```{python}
+#| label: fig-factorial
+#| fig-cap: "Paired factorial effects with speaker-level 95% bootstrap confidence intervals. The horizontal line marks zero effect."
+fig("factorial-effects.png")
+```
+
+Pipeline B versus A on `unseen` gives $\Delta_{BW}=$ `{python} signed(eff('bandpass_wiener_minus_raw')['mean_delta'])`, CI `{python} ci('bandpass_wiener_minus_raw')`: **`{python} verdict('bandpass_wiener_minus_raw')`**. Interaction is `{python} signed(eff('bandpass_x_wiener')['mean_delta'])`, CI `{python} ci('bandpass_x_wiener')`.
+
+## Confusion matrix (RQ4)
+
+```{python}
+#| label: fig-confusion
+#| fig-cap: "Row-normalised confusion matrix in the hardest condition (unseen, `noise`, lowest SNR, first seed): Pipeline A versus Pipeline B."
+fig("confusion-matrices.png")
+```
+
+```{python}
+def confusion_stats(reports):
+    matrix = np.sum([np.asarray(r["nearest_centroid"]["confusion_matrix"], dtype=float) for r in reports], axis=0)
+    recall = np.diag(matrix) / np.clip(matrix.sum(axis=1), 1, None)
+    off = matrix - np.diag(np.diag(matrix))
+    return recall, off
+rows = []
+for name, reports in (("A (raw)", LOW_RAW), ("B (bandpass_wiener)", LOW_B)):
+    recall, off = confusion_stats(reports)
+    rows.append([name, fmt(float(recall.mean())), int((recall < .5).sum()), int(recall.size), fmt(float(off.max() / max(1.0, off.sum())), 4)])
+display(table(["pipeline", "mean recall", "speakers with recall < 0.5", "total speakers", "largest confusion-pair share"], rows))
+```
+
+Errors span many pairs rather than concentrating on one magnet speaker, and Pipeline B does not improve this structure.
+
+## Front-end characterisation at the signal level (RQ3)
+
+```{python}
+display(table(["input SNR (dB)", *[f"SNR gain {c} (dB)" for c in CELLS if c != "raw"]], [[f"{s:g}", *[fmt(gain(c, s), 2) for c in CELLS if c != "raw"]] for s in SNRS]))
+```
+
+```{python}
+display(table(["input SNR (dB)", "SNR before (dB)", "SNR after (dB)", "gain (dB)"], [[fmt(x["input_snr_db"], 1), fmt(x["before_snr_db"], 2), fmt(x["after_snr_db"], 2), fmt(x["snr_gain_db"], 2)] for x in POSITIVE["measurements"]]))
+```
+
+The positive control shows that Wiener increases SNR on stationary Gaussian noise, so recognition results cannot be attributed to a programming error.
+
+```{python}
+#| label: fig-tradeoff
+#| fig-cap: "Each point is a (cell, family, SNR): x is waveform SNR gain relative to Pipeline A and y is accuracy difference relative to Pipeline A. Lower-right means SNR increases while recognition decreases."
+#| out-width: "62%"
+#| fig-pos: "H"
+fig("snr-recognition-tradeoff.png")
+```
+
+# Error Analysis
+
+Analysis is limited to Pipeline A, `unseen`, noisy audio, and SNR `{python} f"{HARD_SNR:g}"` dB. Speakers and samples are mapped to pseudonyms `SPK-##` and `Q-###`; no audio, transcript, or source path is disclosed.
+
+```{python}
+bad = Counter(x["family"] for x in LOW_ERRORS)
+total = Counter(r["noise_family"] for r in LOW_RAW for x in r["query_predictions"])
+stat = defaultdict(lambda: [0, 0])
+for r in LOW_RAW:
+    for q in r["query_predictions"]:
+        stat[q["speaker_id"]][0] += int(not q["correct"]); stat[q["speaker_id"]][1] += 1
+hard = sorted(stat.items(), key=lambda x: (x[1][0] / x[1][1], x[1][0]), reverse=True)
+pairs = Counter((x["true_speaker"], x["predicted_speaker"]) for x in LOW_ERRORS)
+chosen = sorted(LOW_ERRORS, key=lambda x: (-float(x["score"]), x["sample_id"]))
+display(table(["noise family", "errors", "queries", "error rate"], [[f, bad[f], total[f], fmt(bad[f] / total[f])] for f in FAMILIES]))
+```
+
+```{python}
+display(table(["hardest speaker", "errors", "queries", "error rate"], [[SPEAKER_ALIAS[s], b, n, fmt(b / n)] for s, (b, n) in hard[:8]]))
+```
+
+```{python}
+display(table(["confusion pair (true → predicted)", "count"], [[f"{SPEAKER_ALIAS[a]} → {SPEAKER_ALIAS[b]}", n] for (a, b), n in pairs.most_common(8)]))
+```
+
+```{python}
+display(table(["sample", "noise family", "true", "predicted", "cosine score"], [[SAMPLE_ALIAS[x["sample_id"]], x["family"], SPEAKER_ALIAS[x["true_speaker"]], SPEAKER_ALIAS[x["predicted_speaker"]], fmt(float(x["score"]))] for x in chosen[:8]]))
+```
+
+Errors are uneven across families, concentrated in a small group of speakers, and often confident. The highest-score error is `{python} fmt(float(chosen[0]['score']))`; this is cosine similarity to the predicted centroid, not calibrated probability. The deterministic selection rule makes the table reproducible, but no phonetic or demographic cause is inferred.
+
+# Discussion
+
+## Direct answers to the research questions
+
+**RQ1.** Pipeline A degrades as SNR falls, most sharply at `{python} f"{min(SNRS):g}"` dB; `seen` is always higher than `unseen` [@kabir2021; @hanifa2021].
+
+**RQ2.** Band-pass effect: `{python} signed(eff('bandpass_main')['mean_delta'])` (`{python} verdict('bandpass_main')`); Wiener effect: `{python} signed(eff('wiener_main')['mean_delta'])` (`{python} verdict('wiener_main')`); interaction: `{python} signed(eff('bandpass_x_wiener')['mean_delta'])` (`{python} verdict('bandpass_x_wiener')`). Shared checkpoints and mixtures attribute these effects to DSP.
+
+**RQ3.** At `{python} f"{min(SNRS):g}"` dB, Wiener **increases** waveform SNR by `{python} fmt(gain('wiener', min(SNRS)), 2)` dB but accuracy **decreases** by `{python} fmt(abs(eff('wiener_minus_raw')['mean_delta']), 4)` points. The positive control (`{python} fmt(POSITIVE['measurements'][0]['snr_gain_db'], 2)` dB) rules out implementation error.
+
+**RQ4.** Errors concentrate by family and speaker, are often confident, and Pipeline B does not improve the confusion structure.
+
+**Hypothesis verdict.** Both hypotheses are **rejected**. H1 predicts $\Delta_{BW}>0$, but CI `{python} ci('bandpass_wiener_minus_raw')` is entirely negative. H2 is unsupported because Wiener increases SNR while reducing accuracy.
+
+## Why did these results occur?
+
+The encoder already learns robustness from `{python} f"{CONFIG['p_noise']*100:g}"`% noisy samples over SNR `{python} f"{CONFIG['train_snr_range_db'][0]:g}"`–`{python} f"{CONFIG['train_snr_range_db'][1]:g}"` dB and attentive pooling. Band-pass removes `{python} f"{100-DESIGN['retained_energy_pct']['speech']:.2f}"`% of speech energy, including potentially discriminative high-frequency detail. Wiener introduces artifacts and a new mismatch between enhanced inference signals and the unenhanced training distribution, the mismatch identified by @li2022cnceleb and @ferrer2022. This explains why successful methods jointly train enhancement [@li2021; @mohammadamini2022] or learn invariance inside the model [@wang2021; @novoselov2023].
+
+## Strengths and limitations
+
+The design uses identical paired samples, a frozen encoder, training-derived frozen filter parameters, and speaker-level bootstrap. Limitations include one configuration per DSP stage, VCTK's read English speech and low reverberation, additive MUSAN noise, closed-set evaluation without EER or calibration, `{python} CONFIG['segment_seconds']`-s clips, and only three seeds.
+
+# Threats to Validity
+
+**Internal validity.** Paired mixtures, frozen checkpoints, speaker bootstrap, disjoint partitions, recording-level noise splits, and validation-only tuning reduce confounding and leakage. Zero-phase filtering remains offline and non-causal, and the seed count is small.
+
+**External validity.** The conclusion is limited to VCTK + MUSAN, short clips, and a small CNN trained from scratch; it does not automatically extend to other languages, microphones, reverberation, codecs, or large self-supervised encoders [@novoselov2023].
+
+**Construct validity.** Closed-set accuracy does not measure unknown-speaker rejection; waveform SNR is global; cosine score is uncalibrated; and the Gaussian positive control is not representative of real noise. Four metrics, two protocols, and separate signal/recognition evidence mitigate these concerns.
+
+**Conclusion validity.** Multiple contrasts use percentile bootstrap without multiplicity correction. The main conclusion relies on intervals wholly on one side of 0, so this risk is low.
+
+# Conclusion
+
+With a 2×2 factorial design on a frozen encoder, identical mixtures, and speaker-paired bootstrap, Pipeline A (`{python} fmt(mm('raw'))`) is not surpassed by Pipeline B (`{python} fmt(mm('bandpass_wiener'))`) on `unseen`; the main contrasts have 95% CIs on one side of 0, and their interaction does not help. The positive control confirms correct signal-level filtering, so the finding concerns DSP/model interaction rather than implementation error.
+
+When an encoder is noise-robust, compute should favour augmentation and training objectives over a fixed front-end, which costs latency and creates distribution shift. Waveform SNR is useful diagnostically but is the wrong optimisation target for embedding quality.
+
+# Future Work
+
+Priorities are joint front-end/encoder training, reverberation/codec/cross-corpus evaluation, verification/EER/calibration with open-set rejection, and more seeds plus adaptive utterance-level noise estimation. These are proposals, not completed results.
+
+# Ethics Statement
+
+The public VCTK [@vctk] and MUSAN [@musan] datasets are used under their terms and cited; no data were collected directly. Speaker recognition is **biometric** technology with privacy, surveillance, and unequal-error risks. No audio, transcript, or source path is disclosed, and error examples use pseudonyms. Models and artifacts are for research; deployment requires renewed licensing, legal, bias, and human-oversight review. External code and datasets are credited.
 
 # Reproducibility
 
-```bash
-cd /home/truong51972/projects/dsp
-uv run pytest -q
-uv run python run.py all --config configs/config.json
-QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.en.qmd
+```{python}
+display(table(["item", "value"], [["Python", sys.version.split()[0]], ["operating system", f"{platform.system()} {platform.release()} ({platform.machine()})"], ["seeds", ", ".join(map(str, CONFIG["seeds"]))], ["git revision", MANIFEST["git_revision"]], ["config hash", MANIFEST["config_hash"][:16]], ["data cache hash", MANIFEST["data_cache_hash"]], ["run", f"{MANIFEST['run_tag']} — {MANIFEST['status']}"], ["completed phases", ", ".join(k for k, v in MANIFEST["phases"].items() if v["status"] == "completed")]]))
 ```
 
-`main.ipynb` provides the same phased workflow: `RUN_ID = None` creates the next
-run, while an integer resumes only its pending or failed phases using its snapshot.
+The package includes the configuration, pipeline, tests, checkpoints, and artifacts. Reproduction uses `uv sync`, `uv run python -m pytest tests -q`, `uv run python run.py all --config configs/config.json`, and `QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd`. VCTK belongs in `dataset/VCTK-Corpus-0.80/wav48` and MUSAN in `dataset/musan`. Each run is immutable; this report reads `{python} f"outputs/{CONFIG['study_id']}/runs/{MANIFEST['run_tag']}"` and does not retrain or reevaluate. Change `RUN_ID` in the first chunk to report another run.
 
-# References
+# Appendix A — Literature Matrix {.unnumbered}
+
+```{python}
+display(table(["Paper", "DSP", "AI model", "Dataset", "Key findings", "Research gap", "Limitations"], [
+ ["Kabir et al., 2021 (survey) [@kabir2021]", "MFCC, LPCC, PLP", "GMM-UBM, i-vector, DNN embedding", "multiple datasets", "mismatch is central", "no controlled front-end comparison", "no original experiment"],
+ ["Hanifa et al., 2021 (review) [@hanifa2021]", "cepstral, spectral", "GMM, SVM, DNN", "multiple datasets", "noise and channel drive degradation", "few separate preprocessing ablations", "no original experiment"],
+ ["Li et al., 2021 [@li2021]", "log-mel", "gradient regularisation", "VoxCeleb + noise", "regularisation improves robustness", "requires retraining", "verification only"],
+ ["Wang et al., 2021 [@wang2021]", "log-mel", "VIB regularisation", "VoxCeleb", "removing redundancy improves generalisation", "invariance is inside the model", "no systematic SNR evaluation"],
+ ["Ferrer et al., 2022 [@ferrer2022]", "standard features", "calibrated backend", "multiple conditions", "calibration stabilises performance", "no DSP analysis", "no DSP analysis"],
+ ["Li et al., 2022 [@li2022cnceleb]", "standard features", "x-vector / deep embedding", "CN-Celeb", "multi-genre mismatch is severe", "no DSP ablation", "no DSP ablation"],
+ ["MohammadAmini et al., 2022 [@mohammadamini2022]", "enhancement + log-mel", "ResNet embedding", "VoxCeleb + noise", "speaker-objective enhancement helps", "joint training, not fixed inference", "needs parallel data"],
+ ["Novoselov et al., 2023 [@novoselov2023]", "waveform SSL", "wav2vec 2.0", "VoxCeleb + noise", "augmentation improves robustness", "fixed DSP value unclear", "large model"],
+ ["Sharma et al., 2024 (review) [@sharma2024]", "MFCC to learned representations", "multiple generations", "multiple datasets", "shift toward learned representations", "remaining DSP role unquantified", "no original experiment"],
+ ["**This report**", "Welch PSD, Butterworth band-pass, STFT Wiener, log-mel", "CNN + ASP + ArcFace (frozen)", "VCTK + MUSAN", "fixed inference DSP does not improve robust encoder; SNR gain does not predict recognition", "—", "one corpus, additive noise, three seeds, closed-set"],
+]))
+```
+
+# Appendix B — AI Declaration {.unnumbered}
+
+| Item | Content |
+|---|---|
+| AI tools used | ChatGPT; Codex |
+| Purpose of use | Code generation/refactoring, report structure, academic language editing, DSP explanation |
+| Stages of use | Pipeline implementation, tests, figures, manuscript editing |
+| Not used for | Experimental numbers, references, or data. All numbers are computed from run artifacts by code in `src/` |
+| Human verification | AI code was read, edited, and verified with tests and the positive control; citations were checked against originals; numerical prose is generated from artifacts rather than typed by hand |
+| Responsibility statement | The authors take full responsibility for the originality, correctness, and integrity of the submission |
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
