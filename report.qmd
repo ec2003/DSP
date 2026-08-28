@@ -1,7 +1,7 @@
 ---
 title: "Tiền xử lý DSP tại thời điểm suy luận có cải thiện CNN nhận dạng người nói kháng nhiễu hay không?"
 subtitle: "DSP501 Final Assignment — ablation factorial 2×2 trên encoder đóng băng"
-author: "[Tên nhóm; họ tên, MSSV, Khoa CNTT, FPT University HCMC]"
+author: "Trần Quốc Trường; Trần Trung Hiếu"
 date: last-modified
 bibliography: references.bib
 csl: ieee.csl
@@ -21,6 +21,7 @@ format:
     include-in-header:
       text: |
         \usepackage{caption}
+                \usepackage{float}
         \captionsetup{font=small, skip=3pt}
         \setlength{\textfloatsep}{6pt}
         \setlength{\intextsep}{6pt}
@@ -184,17 +185,18 @@ Ba quan sát rút ra từ phần trên. Thứ nhất, các công trình đạt c
 ```{mermaid}
 %%| label: fig-framework
 %%| fig-cap: "Khung nghiên cứu: từ vấn đề tới đánh giá. Chỉ khối DSP processing thay đổi giữa các điều kiện so sánh."
-%%| out-width: "100%"
+%%| fig-width: 7
+%%| fig-height: 3
+%%| out-width: "95%"
+%%{init: {"flowchart": {"nodeSpacing": 15, "rankSpacing": 22}, "themeVariables": {"fontSize": "11px"}}}%%
 flowchart LR
-  P["Research problem:<br/>DSP tại suy luận có giúp<br/>encoder đã robust?"] --> D["Dataset<br/>VCTK speech<br/>+ MUSAN noise"]
-  D --> S["Sampling and quantization<br/>16 kHz; speaker-disjoint split;<br/>nhiễu chia theo recording"]
-  S --> T["Training branch<br/>augmentation MUSAN<br/>3 checkpoint CNN/ArcFace"]
-  S --> M["Mixture test cố định<br/>4 family x 5 SNR<br/>+ clean"]
-  M --> F["DSP processing<br/>(bien doc lap)<br/>raw | bandpass |<br/>wiener | bandpass+wiener"]
-  F --> X["Feature extraction<br/>STFT to log-mel 80 bang<br/>chuan hoa mean-variance"]
-  T -->|freeze| E["AI model<br/>CNN + attentive<br/>stat pooling<br/>embedding 192-D"]
-  X --> E
-  E --> V["Evaluation<br/>nearest-centroid<br/>unseen/seen; P/R/F1;<br/>paired speaker bootstrap"]
+    P["Research<br/>problem"] --> D["VCTK + MUSAN<br/>16 kHz"]
+    D --> F["DSP 2×2<br/>raw / BP / W / BP+W"]
+    F --> X["80-bin<br/>log-mel"]
+    X --> E["Frozen CNN<br/>ArcFace"]
+    E --> V["Identification<br/>speaker bootstrap"]
+    D --> T["Noise-augmented<br/>training"]
+    T --> E
 ```
 
 Chỉ một nhánh trong sơ đồ thay đổi giữa các điều kiện so sánh: khối *DSP processing*. Mọi thứ phía trước (mixture, seed, SNR, family) và phía sau (đặc trưng, checkpoint, enrollment, query) đều cố định.
@@ -430,6 +432,8 @@ Bảng thứ hai là positive control: trên nhiễu Gauss dừng, chuỗi Wiene
 ```{python}
 #| label: fig-tradeoff
 #| fig-cap: "Mỗi điểm là một (cell, family, SNR): trục hoành là SNR gain của waveform so với Pipeline A, trục tung là chênh lệch accuracy so với Pipeline A. Điểm nằm ở góc dưới-phải nghĩa là SNR tăng nhưng nhận dạng giảm."
+#| out-width: "62%"
+#| fig-pos: "H"
 fig("snr-recognition-tradeoff.png")
 ```
 
@@ -568,7 +572,7 @@ display(table(["Paper", "DSP", "AI model", "Dataset", "Key findings", "Research 
 
 | Mục | Nội dung |
 |---|---|
-| Công cụ AI đã dùng | GitHub Copilot (trợ giúp lập trình trong VS Code); [bổ sung công cụ khác nếu nhóm có dùng] |
+| Công cụ AI đã dùng | ChatGPT; Codex |
 | Mục đích sử dụng | Sinh và refactor mã, gợi ý cấu trúc báo cáo, biên tập ngôn ngữ học thuật, giải thích khái niệm DSP |
 | Giai đoạn sử dụng | Cài đặt pipeline, viết test, dựng hình, biên tập bản thảo |
 | Không sử dụng cho | Sinh số liệu thí nghiệm, sinh tài liệu tham khảo, sinh dữ liệu. Mọi con số trong báo cáo được tính từ artifact của run bằng mã trong `src/` |

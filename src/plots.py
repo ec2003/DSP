@@ -345,7 +345,7 @@ def plot_snr_recognition_tradeoff(
     if not path.is_file():
         return
     signal = json.loads(path.read_text(encoding="utf-8"))["measurements"]
-    figure, axis = plt.subplots(figsize=(6, 4))
+    figure, axis = plt.subplots(figsize=(6.4, 3.4))
     for cell in ("bandpass", "wiener", "bandpass_wiener"):
         points = []
         for item in signal:
@@ -373,9 +373,10 @@ def plot_snr_recognition_tradeoff(
             axis.scatter(*zip(*points), alpha=0.65, label=cell)
     axis.axhline(0, color="black", linewidth=0.8)
     axis.axvline(0, color="black", linewidth=0.8)
-    axis.set_xlabel("waveform SNR gain vs raw (dB)")
-    axis.set_ylabel("paired-cell recognition delta vs raw")
-    axis.set_title("Upper-left quadrant: SNR ↑, recognition ↓")
+    axis.set_xlabel("waveform reference-SNR gain vs raw (dB)")
+    axis.set_ylabel("recognition accuracy delta vs raw")
+    axis.set_title("Lower-right quadrant: SNR ↑, recognition ↓")
+    axis.legend(frameon=False, ncol=3, fontsize=8)
     figure.tight_layout()
     figure.savefig(config.report_root / "snr-recognition-tradeoff.png", dpi=160)
     plt.close(figure)
