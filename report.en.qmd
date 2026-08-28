@@ -305,6 +305,8 @@ display(table(["cell (unseen, noisy)", *FAMILIES, "mean"], [[c, *[fmt(mm(c, fami
 ```{python}
 #| label: fig-snr
 #| fig-cap: "Accuracy on the unseen protocol by input SNR, separated by MUSAN noise family. The four curves in each panel are the four factorial cells."
+#| out-width: "62%"
+#| fig-pos: "H"
 fig("snr-curves.png")
 ```
 
