@@ -25,6 +25,9 @@ uv sync
 uv run pytest -q
 uv run python run.py all --config configs/config.json
 QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render report.qmd
+
+# Run interactive Gradio web demo
+python demo_live.py --port 7860
 ```
 
 Download the VCTK distribution used here from
